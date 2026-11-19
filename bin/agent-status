@@ -1,0 +1,732 @@
+#!/usr/bin/python3 -IS
+"""agent-status: a menu bar light for Claude Code and Codex sessions.
+
+Subcommands
+  hook <claude|codex>   called by the agents' hooks; reads the event JSON on stdin
+  menu                  prints the SwiftBar menu
+  open <key>            jumps back to a session and marks it seen
+  seen-all              marks every finished session as seen
+  status                prints the current sessions as JSON
+  install / uninstall   adds or removes the hooks and the SwiftBar plugin
+  trust-codex           asks you, then marks the hooks trusted in Codex
+
+Only the Python standard library is used, so it runs on the system /usr/bin/python3.
+"""
+
+import base64
+import fcntl
+import json
+import os
+import subprocess
+import sys
+import time
+
+STATE_DIR = os.path.expanduser(os.environ.get("AGENT_STATUS_DIR", "~/.agent-status"))
+SELF = os.path.realpath(__file__)
+PLUGIN_NAME = "agent-status"
+HOOK_MARKER = "agent-status\" hook"  # how our hook commands are recognised on uninstall
+
+DONE_TTL = 2 * 3600        # a finished session stops being green after this
+STALE_TTL = 12 * 3600      # a session with no event for this long is forgotten
+WAITING_TTL = 24 * 3600
+
+CLAUDE_BUNDLE = "com.anthropic.claudefordesktop"
+CODEX_BUNDLE = "com.openai.codex"
+
+ASK_TOOLS = {"AskUserQuestion", "ExitPlanMode"}
+WAIT_NOTIFICATIONS = {
+    "permission_prompt", "worker_permission_prompt",
+    "elicitation_dialog", "elicitation_url_dialog", "agent_needs_input",
+}
+
+COLORS = {"waiting": "#E03131", "done": "#2F9E44", "idle": "#ADB5BD", "running": "#ADB5BD"}
+RENDERER = os.path.join(os.path.dirname(os.path.dirname(SELF)), "build", "agent-status-render")
+
+
+def dot(color):
+    """SwiftBar params for a coloured dot. Plain sfcolor is ignored in the menu bar,
+    so the colour goes through a base64 sfconfig in Palette mode."""
+    cfg = json.dumps({"renderingMode": "Palette", "colors": [COLORS[color]]})
+    return "sfimage=circle.fill sfconfig=" + base64.b64encode(cfg.encode()).decode()
+
+
+# ---------------------------------------------------------------- state files
+
+def _path(key):
+    return os.path.join(STATE_DIR, key + ".json")
+
+
+def _safe(s):
+    return "".join(c if c.isalnum() or c in "-_" else "_" for c in str(s))[:100]
+
+
+def load(key):
+    try:
+        with open(_path(key)) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None
+
+
+def save(key, rec):
+    tmp = _path(key) + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(rec, f, ensure_ascii=False)
+    os.replace(tmp, _path(key))
+
+
+def remove(key):
+    try:
+        os.remove(_path(key))
+    except OSError:
+        pass
+
+
+def all_records():
+    out = []
+    try:
+        names = os.listdir(STATE_DIR)
+    except OSError:
+        return out
+    for name in names:
+        if name.endswith(".json"):
+            rec = load(name[:-5])
+            if rec:
+                rec["_key"] = name[:-5]
+                out.append(rec)
+    return out
+
+
+class Lock:
+    def __enter__(self):
+        os.makedirs(STATE_DIR, exist_ok=True)
+        self.f = open(os.path.join(STATE_DIR, ".lock"), "w")
+        fcntl.flock(self.f, fcntl.LOCK_EX)
+        return self
+
+    def __exit__(self, *a):
+        fcntl.flock(self.f, fcntl.LOCK_UN)
+        self.f.close()
+
+
+def color_of(rec):
+    """The colour a single session contributes: waiting / done / idle."""
+    st = rec.get("state")
+    if st == "waiting":
+        return "waiting"
+    if st == "done" and not rec.get("seen"):
+        return "done"
+    return "idle"
+
+
+def overall(records):
+    colors = [color_of(r) for r in records]
+    if "waiting" in colors:
+        return "waiting", colors.count("waiting")
+    if "done" in colors:
+        return "done", colors.count("done")
+    return "idle", 0
+
+
+def refresh_menu():
+    """Ask SwiftBar to re-run the plugin now instead of waiting for its timer."""
+    if not any(os.path.isdir(p) for p in ("/Applications/SwiftBar.app",
+                                           os.path.expanduser("~/Applications/SwiftBar.app"))):
+        return
+    try:
+        subprocess.Popen(["/usr/bin/open", "-g", "swiftbar://refreshplugin?name=" + PLUGIN_NAME],
+                         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL, start_new_session=True)
+    except OSError:
+        pass
+
+
+# ---------------------------------------------------------------- hook
+
+def jump_target(tool, sid):
+    """Work out, from the hook's environment, how to get back to this session."""
+    env = os.environ
+    if tool == "claude":
+        host = env.get("CLAUDE_CODE_HOST_SESSION_ID", "")
+        # Child processes inherit the host id, so also require that this CLI is the
+        # one Desktop started, not a `claude` run inside a Desktop session.
+        if host.startswith("local_") and env.get("CLAUDE_CODE_ENTRYPOINT") == "claude-desktop":
+            return {"kind": "url", "target": "claude://claude.ai/epitaxy/" + host,
+                    "fallback": CLAUDE_BUNDLE}
+    if tool == "codex":
+        if env.get("CODEX_INTERNAL_ORIGINATOR_OVERRIDE", "").endswith("desktop"):
+            return {"kind": "url", "target": "codex://threads/" + sid, "fallback": CODEX_BUNDLE}
+    # Started from a terminal: bring that terminal app forward.
+    bundle = env.get("__CFBundleIdentifier")
+    if bundle:
+        return {"kind": "app", "target": bundle}
+    return {"kind": "app", "target": CLAUDE_BUNDLE if tool == "claude" else CODEX_BUNDLE}
+
+
+def next_state(event, data, cur):
+    """Return (state, reason) for this event, None to leave it, or 'delete'."""
+    st = cur.get("state") if cur else None
+    if event in ("SessionStart", "UserPromptSubmit"):
+        return ("running", "")
+    tool = data.get("tool_name", "")
+    if event in ("PreToolUse", "PermissionRequest") and tool in ASK_TOOLS:
+        # Claude Desktop sends PermissionRequest for its question tools too.
+        return ("waiting", "plan" if tool == "ExitPlanMode" else "question")
+    if event == "PermissionRequest":
+        return ("waiting", "permission")
+    if event == "PreToolUse":
+        return None
+    if event == "Notification":
+        # A fallback only: it follows PermissionRequest and carries less detail.
+        if data.get("notification_type") in WAIT_NOTIFICATIONS and st not in ("done", "waiting"):
+            return ("waiting", "permission")
+        return None
+    if event in ("PostToolUse", "PostToolUseFailure"):
+        # Only clears an approval/question; never overrides a finished turn.
+        return ("running", "") if st == "waiting" else None
+    if event == "Stop":
+        return ("done", "")
+    if event == "Interrupt":
+        return ("idle", "interrupted")
+    if event == "SessionEnd":
+        return "delete"
+    return None
+
+
+def debug_log(tool, data):
+    if not os.path.exists(os.path.join(STATE_DIR, ".debug")):
+        return
+    keep = {k: (v if k not in ("prompt", "tool_input", "tool_response", "last_assistant_message",
+                              "message")
+                else "<%d chars>" % len(json.dumps(v, ensure_ascii=False)))
+            for k, v in data.items()}
+    env = {k: os.environ.get(k) for k in ("CLAUDE_CODE_HOST_SESSION_ID", "CLAUDE_CODE_ENTRYPOINT",
+                                         "CODEX_INTERNAL_ORIGINATOR_OVERRIDE",
+                                         "__CFBundleIdentifier", "TERM_PROGRAM")
+           if os.environ.get(k)}
+    with open(os.path.join(STATE_DIR, "debug.log"), "a") as f:
+        f.write(json.dumps({"t": time.strftime("%H:%M:%S"), "tool": tool, "data": keep,
+                            "env": env}, ensure_ascii=False) + "\n")
+
+
+def cmd_hook(tool):
+    raw = sys.stdin.read()
+    try:
+        data = json.loads(raw) if raw.strip() else {}
+    except ValueError:
+        return
+    os.makedirs(STATE_DIR, exist_ok=True)
+    debug_log(tool, data)
+    event = data.get("hook_event_name") or data.get("event") or ""
+    sid = data.get("session_id") or data.get("thread_id") or ""
+    if not sid or not event:
+        return
+    key = "%s-%s" % (tool, _safe(sid))
+    with Lock():
+        cur = load(key)
+        nxt = next_state(event, data, cur)
+        if nxt is None:
+            return
+        if nxt == "delete":
+            if cur:
+                remove(key)
+                refresh_menu()
+            return
+        state, reason = nxt
+        before = color_of(cur) if cur else None
+        rec = dict(cur or {})
+        cwd = data.get("cwd") or rec.get("cwd") or ""
+        rec.update({
+            "tool": tool,
+            "session_id": sid,
+            "state": state,
+            "reason": reason,
+            "cwd": cwd,
+            "title": os.path.basename(cwd.rstrip("/")) or tool,
+            "updated_at": int(time.time()),
+        })
+        jump = jump_target(tool, sid)
+        # A deep link found once is better than a later, vaguer guess.
+        if jump["kind"] == "url" or (rec.get("jump") or {}).get("kind") != "url":
+            rec["jump"] = jump
+        if reason == "permission" and data.get("tool_name"):
+            rec["detail"] = data["tool_name"]
+        elif state != "waiting":
+            rec.pop("detail", None)
+        if event == "UserPromptSubmit" and isinstance(data.get("prompt"), str):
+            line = data["prompt"].strip().splitlines()[0] if data["prompt"].strip() else ""
+            rec["prompt"] = line[:60]
+        if state == "done":
+            rec["seen"] = False
+        elif state in ("running", "idle"):
+            rec["seen"] = True
+        save(key, rec)
+    if before != color_of(rec):
+        refresh_menu()
+
+
+# ---------------------------------------------------------------- menu
+
+LANG = "zh" if os.environ.get("AGENT_STATUS_LANG", "").startswith("zh") else "en"
+T = {
+    "en": {"permission": "needs approval", "question": "has a question", "plan": "plan to review",
+           "done": "done", "running": "running", "idle": "idle", "interrupted": "interrupted",
+           "none": "No sessions yet", "seen_all": "Mark all as seen", "folder": "Open state folder",
+           "now": "now", "m": "m ago", "h": "h ago"},
+    "zh": {"permission": "等待审批", "question": "有问题要问你", "plan": "等待确认计划",
+           "done": "已完成", "running": "运行中", "idle": "空闲", "interrupted": "已中断",
+           "none": "暂无会话", "seen_all": "全部标为已读", "folder": "打开状态目录",
+           "now": "刚刚", "m": " 分钟前", "h": " 小时前"},
+}[LANG]
+
+
+def ago(ts):
+    d = max(0, int(time.time()) - int(ts or 0))
+    if d < 60:
+        return T["now"]
+    if d < 3600:
+        return "%d%s" % (d // 60, T["m"])
+    return "%d%s" % (d // 3600, T["h"])
+
+
+def prune(records):
+    """Drop forgotten sessions and let old green ones fade to grey."""
+    now = time.time()
+    kept = []
+    for r in records:
+        age = now - r.get("updated_at", 0)
+        limit = WAITING_TTL if r.get("state") == "waiting" else STALE_TTL
+        if age > limit:
+            remove(r["_key"])
+            continue
+        if r.get("state") == "done" and not r.get("seen") and age > DONE_TTL:
+            r["seen"] = True
+            save(r["_key"], {k: v for k, v in r.items() if k != "_key"})
+        kept.append(r)
+    return kept
+
+
+def _q(s):
+    return '"%s"' % str(s).replace('"', "'")
+
+
+def _clean(s):
+    return str(s).replace("|", "/").replace("\n", " ")
+
+
+def render_badge(waiting, done, other):
+    """Base64 PNG of the three count boxes, cached per combination of counts."""
+    if not os.access(RENDERER, os.X_OK):
+        return None
+    cache = os.path.join(STATE_DIR, "cache")
+    path = os.path.join(cache, "%d-%d-%d.b64" % (waiting, done, other))
+    try:
+        with open(path) as f:
+            return f.read().strip()
+    except OSError:
+        pass
+    try:
+        out = subprocess.run([RENDERER, str(waiting), str(done), str(other)],
+                             capture_output=True, text=True, timeout=5).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if out:
+        os.makedirs(cache, exist_ok=True)
+        with open(path, "w") as f:
+            f.write(out)
+    return out or None
+
+
+def cmd_menu():
+    with Lock():
+        records = prune(all_records())
+    color, count = overall(records)
+    colors = [color_of(r) for r in records]
+    badge = render_badge(colors.count("waiting"), colors.count("done"), colors.count("idle"))
+    if badge:
+        print("| image=" + badge)
+    else:  # renderer not built: a single coloured dot with the count
+        print("%s | %s" % (str(count) if count else "", dot(color)))
+    print("---")
+    order = {"waiting": 0, "done": 1, "idle": 2}
+    records.sort(key=lambda r: (order[color_of(r)], -r.get("updated_at", 0)))
+    if not records:
+        print("%s | color=gray" % T["none"])
+    for r in records:
+        c = color_of(r)
+        if r.get("state") == "waiting":
+            status = T.get(r.get("reason"), T["permission"])
+            if r.get("detail"):
+                status += " · " + r["detail"]
+        elif r.get("state") == "done":
+            status = T["done"]
+        else:
+            status = T.get(r.get("reason") or r.get("state"), T["idle"])
+        tool = "Claude" if r.get("tool") == "claude" else "Codex"
+        label = "%s · %s — %s (%s)" % (tool, r.get("title", ""), status, ago(r.get("updated_at")))
+        line = "%s | bash=%s param1=open param2=%s terminal=false refresh=true " \
+               "%s" % (_clean(label), _q(SELF), r["_key"], dot(c))
+        if r.get("prompt"):
+            line += " tooltip=%s" % _q(_clean(r["prompt"]))
+        print(line)
+        if r.get("prompt"):
+            print("--%s | color=gray size=12" % _clean(r["prompt"]))
+    print("---")
+    print("%s | bash=%s param1=seen-all terminal=false refresh=true" % (T["seen_all"], _q(SELF)))
+    print("%s | bash=/usr/bin/open param1=%s terminal=false" % (T["folder"], _q(STATE_DIR)))
+
+
+# ---------------------------------------------------------------- actions
+
+def _activate(bundle):
+    """Bring an app to the front. `open -b` alone may leave it behind the current app."""
+    script = 'tell application id "%s" to activate' % bundle
+    if subprocess.call(["/usr/bin/osascript", "-e", script],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL) == 0:
+        return True
+    return subprocess.call(["/usr/bin/open", "-b", bundle]) == 0
+
+
+def cmd_open(key):
+    with Lock():
+        rec = load(key)
+        if not rec:
+            return
+        if rec.get("state") == "done":
+            rec["seen"] = True
+            save(key, rec)
+    jump = rec.get("jump") or {}
+    default = CLAUDE_BUNDLE if rec.get("tool") == "claude" else CODEX_BUNDLE
+    if jump.get("kind") == "url":
+        # The deep link switches the app to the session; then bring the app forward.
+        subprocess.call(["/usr/bin/open", jump["target"]])
+        _activate(jump.get("fallback") or default)
+    elif jump.get("kind") == "app":
+        if not _activate(jump["target"]):
+            _activate(default)
+    else:
+        _activate(default)
+
+
+def cmd_seen_all():
+    with Lock():
+        for r in all_records():
+            if r.get("state") == "done" and not r.get("seen"):
+                r["seen"] = True
+                save(r.pop("_key"), r)
+
+
+def cmd_status():
+    records = all_records()
+    color, count = overall(records)
+    print(json.dumps({"overall": color, "count": count,
+                      "sessions": [{k: v for k, v in r.items() if k != "_key"} for r in records]},
+                     ensure_ascii=False, indent=2))
+
+
+# ---------------------------------------------------------------- install
+
+CLAUDE_EVENTS = [
+    ("SessionStart", None), ("UserPromptSubmit", None),
+    ("PreToolUse", "AskUserQuestion|ExitPlanMode"), ("PermissionRequest", None),
+    ("Notification", "|".join(sorted(WAIT_NOTIFICATIONS))),
+    ("PostToolUse", None), ("PostToolUseFailure", None),
+    ("Stop", None), ("SessionEnd", None),
+]
+CODEX_EVENTS = [
+    ("SessionStart", None), ("UserPromptSubmit", None), ("PermissionRequest", None),
+    ("PostToolUse", None), ("Stop", None), ("Interrupt", None), ("SessionEnd", None),
+]
+
+
+def _hook_cmd(tool):
+    return '"%s" hook %s' % (SELF, tool)
+
+
+def _strip_ours(hooks):
+    """Remove our entries from a hooks mapping, leaving everybody else's untouched."""
+    for event in list(hooks):
+        groups = []
+        for g in hooks[event]:
+            inner = [h for h in g.get("hooks", []) if HOOK_MARKER not in h.get("command", "")]
+            if inner:
+                g = dict(g, hooks=inner)
+                groups.append(g)
+            elif not g.get("hooks"):
+                groups.append(g)
+        if groups:
+            hooks[event] = groups
+        else:
+            del hooks[event]
+
+
+def _edit_json(path, fn):
+    data = {}
+    if os.path.exists(path):
+        with open(path) as f:
+            text = f.read()
+        data = json.loads(text) if text.strip() else {}
+        backup = "%s.bak-agent-status-%s" % (path, time.strftime("%Y%m%d-%H%M%S"))
+        with open(backup, "w") as f:
+            f.write(text)
+        print("  backup: " + backup)
+    fn(data)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+        f.write("\n")
+    os.replace(tmp, path)
+    print("  wrote:  " + path)
+
+
+def _install_hooks(path, tool, events):
+    def fn(data):
+        hooks = data.setdefault("hooks", {})
+        _strip_ours(hooks)
+        for event, matcher in events:
+            group = {"hooks": [{"type": "command", "command": _hook_cmd(tool), "timeout": 3}]}
+            if matcher:
+                group = dict({"matcher": matcher}, **group)
+            hooks.setdefault(event, []).append(group)
+    _edit_json(path, fn)
+
+
+def _uninstall_hooks(path):
+    if not os.path.exists(path):
+        return
+
+    def fn(data):
+        _strip_ours(data.get("hooks", {}))
+        if data.get("hooks") == {}:
+            del data["hooks"]
+    _edit_json(path, fn)
+
+
+def _swiftbar_dir():
+    try:
+        out = subprocess.run(["/usr/bin/defaults", "read", "com.ameba.SwiftBar", "PluginDirectory"],
+                             capture_output=True, text=True).stdout.strip()
+    except OSError:
+        return None
+    return os.path.expanduser(out) if out else None
+
+
+def _system_lang():
+    try:
+        out = subprocess.run(["/usr/bin/defaults", "read", "-g", "AppleLanguages"],
+                             capture_output=True, text=True).stdout
+    except OSError:
+        return "en"
+    for line in out.splitlines():
+        line = line.strip(' ",()')
+        if line:
+            return "zh" if line.startswith("zh") else "en"
+    return "en"
+
+
+def _plugin_path():
+    d = _swiftbar_dir()
+    return os.path.join(d, PLUGIN_NAME + ".1m.sh") if d else None
+
+
+def build_renderer():
+    """Compile the badge renderer. Without it the menu falls back to a coloured dot."""
+    import shutil
+    src = os.path.join(os.path.dirname(os.path.dirname(SELF)), "src", "render.swift")
+    print("Badge renderer:")
+    if not shutil.which("swiftc"):
+        print("  swiftc not found (xcode-select --install); using a plain coloured dot.")
+        return
+    os.makedirs(os.path.dirname(RENDERER), exist_ok=True)
+    if subprocess.call(["swiftc", "-O", src, "-o", RENDERER]) == 0:
+        shutil.rmtree(os.path.join(STATE_DIR, "cache"), ignore_errors=True)
+        print("  built:  " + RENDERER)
+    else:
+        print("  build failed; using a plain coloured dot.")
+
+
+def cmd_install():
+    os.makedirs(STATE_DIR, exist_ok=True)
+    os.chmod(SELF, 0o755)
+    build_renderer()
+    print("Claude Code:")
+    _install_hooks(os.path.expanduser("~/.claude/settings.json"), "claude", CLAUDE_EVENTS)
+    print("Codex:")
+    _install_hooks(os.path.expanduser("~/.codex/hooks.json"), "codex", CODEX_EVENTS)
+    plugin = _plugin_path()
+    print("SwiftBar:")
+    if plugin:
+        with open(plugin, "w") as f:
+            f.write("#!/bin/sh\n# <swiftbar.hideRunInTerminal>true</swiftbar.hideRunInTerminal>\n"
+                    "# <swiftbar.hideLastUpdated>true</swiftbar.hideLastUpdated>\n"
+                    "# <swiftbar.hideDisablePlugin>true</swiftbar.hideDisablePlugin>\n"
+                    "# <swiftbar.hideSwiftBar>false</swiftbar.hideSwiftBar>\n"
+                    "export AGENT_STATUS_LANG=%s\nexec \"%s\" menu\n" % (_system_lang(), SELF))
+        os.chmod(plugin, 0o755)
+        print("  wrote:  " + plugin)
+        refresh_menu()
+    else:
+        print("  SwiftBar plugin folder not found. Install SwiftBar (brew install --cask swiftbar),\n"
+              "  choose a plugin folder, then run install again.")
+    print("\nCodex trust:")
+    if sys.stdin.isatty() and _codex_exe():
+        cmd_trust_codex()
+    else:
+        print("  Codex runs new hooks only after you trust them. Run:\n"
+              "    %s trust-codex\n"
+              "  or open Codex → Settings → Hooks → Review hooks." % _q(SELF))
+    print("\nDone. New Claude Code / Codex sessions pick up the hooks.")
+
+
+# ---------------------------------------------------------------- codex trust
+
+def _codex_exe():
+    import shutil
+    for exe in (shutil.which("codex"), "/opt/homebrew/bin/codex", "/usr/local/bin/codex",
+                "/Applications/ChatGPT.app/Contents/Resources/codex-cli/bin/codex"):
+        if exe and os.access(exe, os.X_OK):
+            return exe
+    return None
+
+
+class _AppServer:
+    """Minimal JSON-lines client for `codex app-server`, the API the Codex app itself
+    uses to list hooks and record that the user trusts them."""
+
+    def __init__(self, exe):
+        self.p = subprocess.Popen([exe, "app-server"], stdin=subprocess.PIPE,
+                                  stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        self.buf = b""
+        self.next_id = 0
+        self.request("initialize", {"clientInfo": {"name": "agent-status", "version": "0.1"}})
+        self._send({"method": "initialized"})
+
+    def _send(self, msg):
+        self.p.stdin.write((json.dumps(msg) + "\n").encode())
+        self.p.stdin.flush()
+
+    def request(self, method, params, timeout=20):
+        import select
+        self.next_id += 1
+        rid = self.next_id
+        self._send({"id": rid, "method": method, "params": params})
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            while b"\n" in self.buf:
+                line, self.buf = self.buf.split(b"\n", 1)
+                try:
+                    msg = json.loads(line)
+                except ValueError:
+                    continue
+                if msg.get("id") == rid and ("result" in msg or "error" in msg):
+                    if "error" in msg:
+                        raise RuntimeError("%s failed: %s" % (method, msg["error"]))
+                    return msg["result"]
+            ready, _, _ = select.select([self.p.stdout], [], [], deadline - time.time())
+            if not ready:
+                break
+            chunk = os.read(self.p.stdout.fileno(), 65536)
+            if not chunk:
+                break
+            self.buf += chunk
+        raise RuntimeError("%s: no answer from codex app-server" % method)
+
+    def close(self):
+        try:
+            self.p.stdin.close()
+            self.p.wait(timeout=3)
+        except Exception:
+            self.p.kill()
+
+
+def _our_codex_hooks(server):
+    hooks = {}
+    for group in server.request("hooks/list", {}).get("data", []):
+        for h in group.get("hooks", []):
+            if HOOK_MARKER in h.get("command", ""):
+                hooks[h["key"]] = h
+    return list(hooks.values())
+
+
+def cmd_trust_codex():
+    exe = _codex_exe()
+    if not exe:
+        print("  codex not found; skipping.")
+        return 1
+    server = _AppServer(exe)
+    try:
+        hooks = _our_codex_hooks(server)
+        pending = [h for h in hooks if h.get("trustStatus") != "trusted"]
+        if not hooks:
+            print("  No agent-status hooks in Codex yet. Run install first.")
+            return 1
+        if not pending:
+            print("  All %d agent-status hooks are already trusted." % len(hooks))
+            return 0
+        print("  These hooks run outside Codex's sandbox, on every matching event:")
+        for h in pending:
+            print("    %-18s %s" % (h["eventName"], h["command"]))
+        if not sys.stdin.isatty():
+            print("  Run this in a terminal to confirm: %s trust-codex" % _q(SELF))
+            return 1
+        answer = input("  Trust these %d hooks in Codex? [y/N] " % len(pending)).strip().lower()
+        if answer not in ("y", "yes"):
+            print("  Not trusted. Codex will skip them until you trust them.")
+            return 1
+        edits = [{"keyPath": "hooks.state.%s.trusted_hash" % json.dumps(h["key"]),
+                  "value": h["currentHash"], "mergeStrategy": "upsert"} for h in pending]
+        server.request("config/batchWrite", {"edits": edits, "filePath": None,
+                                             "expectedVersion": None, "reloadUserConfig": True})
+        after = _our_codex_hooks(server)
+        ok = sum(1 for h in after if h.get("trustStatus") == "trusted")
+        print("  Trusted %d of %d agent-status hooks." % (ok, len(after)))
+        return 0 if ok == len(after) else 1
+    finally:
+        server.close()
+
+
+def cmd_uninstall():
+    print("Claude Code:")
+    _uninstall_hooks(os.path.expanduser("~/.claude/settings.json"))
+    print("Codex:")
+    _uninstall_hooks(os.path.expanduser("~/.codex/hooks.json"))
+    plugin = _plugin_path()
+    if plugin and os.path.exists(plugin):
+        os.remove(plugin)
+        print("SwiftBar:\n  removed " + plugin)
+    print("\nState folder left in place: %s (delete it if you like)." % STATE_DIR)
+
+
+# ---------------------------------------------------------------- main
+
+def main(argv):
+    cmd = argv[1] if len(argv) > 1 else ""
+    if cmd == "hook":
+        try:
+            cmd_hook(argv[2] if len(argv) > 2 else "claude")
+        except Exception:
+            pass  # a hook must never break the agent
+        return 0
+    if cmd == "menu":
+        cmd_menu()
+    elif cmd == "open" and len(argv) > 2:
+        cmd_open(argv[2])
+    elif cmd == "seen-all":
+        cmd_seen_all()
+    elif cmd == "status":
+        cmd_status()
+    elif cmd == "install":
+        cmd_install()
+    elif cmd == "uninstall":
+        cmd_uninstall()
+    elif cmd == "trust-codex":
+        return cmd_trust_codex() or 0
+    else:
+        print(__doc__.strip())
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))
