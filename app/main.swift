@@ -27,7 +27,10 @@ struct Session: Codable, Identifiable, Equatable {
     let cwd: String
     let updated_at: Double
     let prompt: String
+    let app: String?      // the agent's display name, e.g. "Claude"
+    let bundle: String?   // its app's bundle id, for the icon
     var id: String { key }
+    var appName: String { app ?? tool.capitalized }
 }
 
 struct Snapshot: Codable, Equatable {
@@ -254,17 +257,30 @@ struct Actions {
     var quit: () -> Void
 }
 
-enum Filter: String, CaseIterable { case all, claude, codex }
-
 struct Panel: View {
     @ObservedObject var store: Store
     let actions: Actions
-    @State private var filter: Filter = .all
+    @State private var toolFilter = ""   // "" for all agents, else a session's `tool`
     @State private var kindFilter: Kind? = nil
+
+    /// The agents that have sessions right now, in a stable order, with their counts.
+    private var tools: [(tool: String, name: String, count: Int)] {
+        var order: [String] = [], names: [String: String] = [:], counts: [String: Int] = [:]
+        for s in store.snap.sessions {
+            if counts[s.tool] == nil { order.append(s.tool); names[s.tool] = s.appName }
+            counts[s.tool, default: 0] += 1
+        }
+        return order.sorted { names[$0]! < names[$1]! }.map { ($0, names[$0]!, counts[$0]!) }
+    }
+
+    /// The tool filter, ignored once that agent has no sessions left.
+    private var activeTool: String {
+        tools.contains { $0.tool == toolFilter } ? toolFilter : ""
+    }
 
     private var sessions: [Session] {
         store.snap.sessions.filter { s in
-            (filter == .all || s.tool == filter.rawValue)
+            (activeTool.isEmpty || s.tool == activeTool)
                 && (kindFilter == nil || s.kind == kindFilter?.rawValue)
         }
     }
@@ -273,7 +289,7 @@ struct Panel: View {
         VStack(alignment: .leading, spacing: 0) {
             header
             statusStrip
-            if !store.snap.sessions.isEmpty {
+            if tools.count > 1 {
                 filterBar
             }
             Divider()
@@ -321,12 +337,11 @@ struct Panel: View {
     }
 
     private var filterBar: some View {
-        let claudeCount = store.snap.sessions.filter { $0.tool == "claude" }.count
-        let codexCount = store.snap.sessions.filter { $0.tool == "codex" }.count
-        return Picker("", selection: $filter) {
-            Text(L.all).tag(Filter.all)
-            Text(claudeCount > 0 ? "Claude \(claudeCount)" : "Claude").tag(Filter.claude)
-            Text(codexCount > 0 ? "Codex \(codexCount)" : "Codex").tag(Filter.codex)
+        Picker("", selection: Binding(get: { activeTool }, set: { toolFilter = $0 })) {
+            Text(L.all).tag("")
+            ForEach(tools, id: \.tool) { t in
+                Text("\(t.name) \(t.count)").tag(t.tool)
+            }
         }
         .pickerStyle(.segmented)
         .labelsHidden()
@@ -476,7 +491,7 @@ struct SessionRow: View {
     var body: some View {
         Button(action: action) {
             HStack(alignment: .center, spacing: 9) {
-                AppIcon(tool: session.tool, size: 22)
+                AppIcon(bundle: session.bundle ?? "", size: 22)
                 VStack(alignment: .leading, spacing: 2) {
                     HStack(alignment: .firstTextBaseline, spacing: 6) {
                         Text(session.name)
@@ -528,17 +543,17 @@ struct SessionRow: View {
     }
 }
 
-/// The app's own icon (Claude or Codex), or a plain symbol if it isn't installed.
+/// The agent app's own icon, or a plain symbol if that app isn't installed.
 struct AppIcon: View {
-    let tool: String
+    let bundle: String
     let size: CGFloat
     private static var cache: [String: NSImage] = [:]
 
     var body: some View {
-        if let img = Self.icon(tool) {
+        if let img = Self.icon(bundle) {
             Image(nsImage: img).resizable().interpolation(.high).frame(width: size, height: size)
         } else {
-            Image(systemName: tool == "claude" ? "sparkle" : "chevron.left.forwardslash.chevron.right")
+            Image(systemName: "sparkle")
                 .font(.system(size: size * 0.55, weight: .semibold))
                 .foregroundStyle(.secondary)
                 .frame(width: size, height: size)
@@ -546,12 +561,12 @@ struct AppIcon: View {
         }
     }
 
-    static func icon(_ tool: String) -> NSImage? {
-        if let hit = cache[tool] { return hit }
-        let bundle = tool == "claude" ? "com.anthropic.claudefordesktop" : "com.openai.codex"
-        guard let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundle) else { return nil }
+    static func icon(_ bundle: String) -> NSImage? {
+        if let hit = cache[bundle] { return hit }
+        guard !bundle.isEmpty,
+              let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundle) else { return nil }
         let img = NSWorkspace.shared.icon(forFile: url.path)
-        cache[tool] = img
+        cache[bundle] = img
         return img
     }
 }

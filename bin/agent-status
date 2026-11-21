@@ -1,8 +1,8 @@
 #!/usr/bin/python3 -IS
-"""agent-status: a menu bar light for Claude Code and Codex sessions.
+"""agent-status: a menu bar light for your coding agents' sessions.
 
 Subcommands
-  hook <claude|codex>   called by the agents' hooks; reads the event JSON on stdin
+  hook <agent> [event]  called by the agents' hooks; reads the event JSON on stdin
   status                sessions to show, as JSON (what the menu bar app reads)
   dump                  every stored record, as JSON, for debugging
   open <key>            jumps back to a session and marks it seen
@@ -13,7 +13,6 @@ Subcommands
 Only the Python standard library is used, so it runs on the system /usr/bin/python3.
 """
 
-import base64
 import calendar
 import fcntl
 import glob
@@ -36,9 +35,6 @@ HOOK_MARKER = "agent-status\" hook"  # how our hook commands are recognised on u
 # record of yet, and when to delete records that are no longer shown.
 RECENT = 24 * 3600
 
-# What the apps themselves record, read to correct and complete what the hooks saw.
-CLAUDE_DESKTOP_SESSIONS = "~/Library/Application Support/Claude/claude-code-sessions"
-CLAUDE_PROJECTS = "~/.claude/projects"
 CODEX_HOME = os.environ.get("CODEX_HOME", "~/.codex")
 
 CLAUDE_BUNDLE = "com.anthropic.claudefordesktop"
@@ -124,62 +120,44 @@ def color_of(rec):
     return "read"  # finished and seen, or interrupted
 
 
-# ---------------------------------------------------------------- hook
+# ---------------------------------------------------------------- state machine
+#
+# Every agent's hook events are first translated (by its adapter, below) into one of
+# these, so the rules for what each one means live in one place:
+#
+#   start      a session started or was resumed: not a new turn by itself
+#   prompt     you sent a message: a turn starts
+#   working    the agent is at work (for agents with no prompt event)
+#   wait       it needs you: an approval, a question, a plan (reason says which)
+#   wait_hint  a weaker "needs you" signal, used only if nothing better came first
+#   tool_done  a tool finished: an approval or question was answered
+#   turn_done  the turn finished
+#   interrupt  the turn was stopped
+#   end        the session closed
 
-def jump_target(tool, sid):
-    """Work out, from the hook's environment, how to get back to this session."""
-    env = os.environ
-    if tool == "claude":
-        host = env.get("CLAUDE_CODE_HOST_SESSION_ID", "")
-        # Child processes inherit the host id, so also require that this CLI is the
-        # one Desktop started, not a `claude` run inside a Desktop session.
-        if host.startswith("local_") and env.get("CLAUDE_CODE_ENTRYPOINT") == "claude-desktop":
-            return {"kind": "url", "target": "claude://claude.ai/epitaxy/" + host,
-                    "fallback": CLAUDE_BUNDLE}
-    if tool == "codex":
-        # Seen in practice: "Codex Desktop".
-        if env.get("CODEX_INTERNAL_ORIGINATOR_OVERRIDE", "").lower().endswith("desktop"):
-            return {"kind": "url", "target": "codex://threads/" + sid, "fallback": CODEX_BUNDLE}
-    # Started from a terminal: bring that terminal app forward.
-    bundle = env.get("__CFBundleIdentifier")
-    if bundle:
-        return {"kind": "app", "target": bundle}
-    return {"kind": "app", "target": CLAUDE_BUNDLE if tool == "claude" else CODEX_BUNDLE}
-
-
-def next_state(event, data, cur):
-    """Return (state, reason) for this event, None to leave it, or 'delete'."""
+def next_state(kind, reason, cur):
+    """(state, reason) for a translated event, None to leave the state, or 'ended'."""
     st = cur.get("state") if cur else None
-    if event == "UserPromptSubmit":
+    if kind == "prompt" or kind == "working":
         return ("running", "")
-    if event == "SessionStart":
-        # Also sent when Desktop resumes an old session or a turn compacts: not a new
-        # turn. A session we don't know yet gets its state from its transcript.
+    if kind == "start":
+        # Also sent when an app resumes an old session or a turn compacts. A session
+        # we don't know yet gets its state from its transcript.
         if cur and not cur.get("hidden"):
             return None
         return (st, cur.get("reason", "") if cur else "")
-    tool = data.get("tool_name", "")
-    if event in ("PreToolUse", "PermissionRequest") and tool in ASK_TOOLS:
-        # Claude Desktop sends PermissionRequest for its question tools too.
-        return ("waiting", "plan" if tool == "ExitPlanMode" else "question")
-    if event == "PermissionRequest":
-        return ("waiting", "permission")
-    if event == "PreToolUse":
-        return None
-    if event == "Notification":
-        # A fallback only: it follows PermissionRequest and carries less detail.
-        if data.get("notification_type") in WAIT_NOTIFICATIONS and st not in ("done", "waiting"):
-            return ("waiting", "permission")
-        return None
-    if event in ("PostToolUse", "PostToolUseFailure"):
-        # Clears an approval or question, or shows an idle session is working again.
+    if kind == "wait":
+        return ("waiting", reason or "permission")
+    if kind == "wait_hint":
+        return ("waiting", "permission") if st not in ("done", "waiting") else None
+    if kind == "tool_done":
         # Never overrides a finished turn.
         return ("running", "") if st in ("waiting", "idle") else None
-    if event == "Stop":
+    if kind == "turn_done":
         return ("done", "")
-    if event == "Interrupt":
+    if kind == "interrupt":
         return ("idle", "interrupted")
-    if event == "SessionEnd":
+    if kind == "end":
         return "ended"
     return None
 
@@ -188,11 +166,12 @@ def debug_log(tool, data):
     if not os.path.exists(os.path.join(STATE_DIR, ".debug")):
         return
     keep = {k: (v if k not in ("prompt", "tool_input", "tool_response", "last_assistant_message",
-                              "message")
+                              "message", "lastUserInput", "toolCall")
                 else "<%d chars>" % len(json.dumps(v, ensure_ascii=False)))
             for k, v in data.items()}
     env = {k: os.environ.get(k) for k in ("CLAUDE_CODE_HOST_SESSION_ID", "CLAUDE_CODE_ENTRYPOINT",
                                          "CODEX_INTERNAL_ORIGINATOR_OVERRIDE",
+                                         "ANTIGRAVITY_CONVERSATION_ID",
                                          "__CFBundleIdentifier", "TERM_PROGRAM")
            if os.environ.get(k)}
     with open(os.path.join(STATE_DIR, "debug.log"), "a") as f:
@@ -200,34 +179,32 @@ def debug_log(tool, data):
                             "env": env}, ensure_ascii=False) + "\n")
 
 
-def cmd_hook(tool):
-    raw = sys.stdin.read()
+def cmd_hook(tool, raw, event=""):
+    agent = AGENTS.get(tool)
     try:
         data = json.loads(raw) if raw.strip() else {}
     except ValueError:
         return
+    if not agent or not isinstance(data, dict):
+        return
     os.makedirs(STATE_DIR, exist_ok=True)
+    if event:
+        data.setdefault("hook_event_name", event)
     debug_log(tool, data)
-    event = data.get("hook_event_name") or data.get("event") or ""
-    sid = data.get("session_id") or data.get("thread_id") or ""
-    if not sid or not event:
+    ev = agent.translate(data.get("hook_event_name") or "", data)
+    if not ev or not ev.get("sid"):
         return
-    if tool == "codex" and not data.get("transcript_path"):
-        # The Codex app runs short internal sessions of its own (summaries, safety
-        # review) that fire hooks too. They have no transcript and no thread you
-        # could open, so they aren't yours to track.
-        return
-    key = "%s-%s" % (tool, _safe(sid))
+    key = "%s-%s" % (tool, _safe(ev["sid"]))
     with Lock():
         cur = load(key)
-        nxt = next_state(event, data, cur)
+        nxt = next_state(ev["kind"], ev.get("reason", ""), cur)
         if nxt is None:
             return
         if nxt == "ended":
-            # Kept, hidden, so the transcript scan doesn't bring it back. Not for
-            # Desktop / Codex app sessions: the apps end them on every quit and
-            # resume them later; archiving is what really closes them there. But
-            # the process is gone, so a turn that was running or waiting has stopped.
+            # Kept, hidden, so the transcript scan doesn't bring it back. Not for app
+            # sessions: the apps end them on every quit and resume them later, and
+            # archiving is what really closes them there. But the process is gone,
+            # so a turn that was running or waiting has stopped.
             if cur and (cur.get("jump") or {}).get("kind") == "url":
                 if cur.get("state") in ("running", "waiting"):
                     cur.update(state="idle", reason="", updated_at=int(time.time()))
@@ -241,52 +218,43 @@ def cmd_hook(tool):
         state, reason = nxt
         rec = dict(cur or {})
         rec.pop("hidden", None)
-        if data.get("transcript_path"):
-            rec["transcript"] = data["transcript_path"]
-        cwd = data.get("cwd") or rec.get("cwd") or ""
+        if ev.get("transcript"):
+            rec["transcript"] = ev["transcript"]
+        cwd = ev.get("cwd") or rec.get("cwd") or ""
         rec.update({
             "tool": tool,
-            "session_id": sid,
+            "session_id": ev["sid"],
             "state": state,
             "reason": reason,
             "cwd": cwd,
-            "title": os.path.basename(cwd.rstrip("/")) or tool,
+            "title": os.path.basename(cwd.rstrip("/")) or agent.label,
             "updated_at": int(time.time()),
         })
-        jump = jump_target(tool, sid)
+        jump = agent.jump(ev["sid"], data)
         # A deep link found once is better than a later, vaguer guess.
         if jump["kind"] == "url" or (rec.get("jump") or {}).get("kind") != "url":
             rec["jump"] = jump
-        if reason == "permission" and data.get("tool_name"):
-            rec["detail"] = data["tool_name"]
+        if state == "waiting" and ev.get("detail"):
+            rec["detail"] = ev["detail"]
         elif state != "waiting":
             rec.pop("detail", None)
-        if event == "UserPromptSubmit" and isinstance(data.get("prompt"), str):
-            line = data["prompt"].strip().splitlines()[0] if data["prompt"].strip() else ""
-            rec["prompt"] = line[:60]
+        if ev.get("prompt"):
+            rec["prompt"] = ev["prompt"]
         if state == "done":
             rec["seen"] = False
             rec.pop("seen_at", None)
-            if tool == "claude" and _desktop_on_screen(rec):
+            if agent.on_screen(rec):
                 rec["seen"], rec["seen_at"] = True, int(time.time())
         elif state in ("running", "idle"):
             rec["seen"] = True
         save(key, rec)
 
 
-# ---------------------------------------------------------------- what the apps record
-#
-# Hooks give the live signal, and are the only way to see an approval or a question.
-# But a session that hasn't fired a hook since install is invisible to them, and some
-# changes send no hook at all (Esc in Claude Code, a denied approval). So every menu
-# refresh also reads, for recently active sessions:
-#   - the end of the transcript: did the last turn finish, get interrupted, or is it going?
-#   - Claude Desktop's session files: title, archived, when you last looked at it
-#   - Codex's state database: title, archived, and the app's own read/unread mark
+# ---------------------------------------------------------------- helpers for adapters
 
 def _iso(ts):
     try:
-        return calendar.timegm(time.strptime(str(ts)[:19], "%Y-%m-%dT%H:%M:%S"))
+        return calendar.timegm(time.strptime(str(ts)[:19].replace(" ", "T"), "%Y-%m-%dT%H:%M:%S"))
     except ValueError:
         return 0
 
@@ -304,91 +272,9 @@ def _tail(path, size=256 * 1024):
     return (lines[1:] if n > size else lines)[::-1]
 
 
-def claude_turn(path):
-    """(state, reason, time) of the last turn in a Claude Code transcript, or None."""
-    for raw in _tail(path):
-        if not raw.strip():
-            continue
-        try:
-            d = json.loads(raw)
-        except ValueError:
-            continue
-        kind, ts = d.get("type"), _iso(d.get("timestamp"))
-        if kind == "system":
-            if d.get("subtype") in ("stop_hook_summary", "turn_duration"):
-                return ("done", "", ts)
-        elif kind == "assistant":
-            if (d.get("message") or {}).get("stop_reason") in ("end_turn", "stop_sequence"):
-                return ("done", "", ts)
-            return ("running", "", ts)
-        elif kind == "user" and not d.get("isMeta"):
-            if b"[Request interrupted by user" in raw:  # Esc, or a denied approval
-                return ("idle", "interrupted", ts)
-            if b"<local-command-stdout>" in raw:  # a slash command that ran no turn
-                continue
-            return ("running", "", ts)
-    return None
-
-
-def codex_turn(path):
-    """(state, reason, time) of the last turn in a Codex rollout file, or None."""
-    for raw in _tail(path):
-        if b'"event_msg"' not in raw:
-            continue
-        try:
-            d = json.loads(raw)
-        except ValueError:
-            continue
-        kind, ts = (d.get("payload") or {}).get("type"), _iso(d.get("timestamp"))
-        if kind == "task_complete":
-            return ("done", "", ts)
-        if kind == "turn_aborted":
-            return ("idle", "interrupted", ts)
-        if kind in ("task_started", "turn_started"):
-            return ("running", "", ts)
-    return None
-
-
-def codex_thread_source(path):
-    """Who started a Codex thread, from its rollout's first line: "user" for one you
-    started, something else for a subagent; "" if the file isn't there yet."""
-    try:
-        with open(path, "rb") as f:
-            meta = json.loads(f.readline())
-    except (OSError, ValueError):
-        return ""
-    p = meta.get("payload") or {}
-    if isinstance(p.get("source"), dict) and "subagent" in p["source"]:
-        return "subagent"
-    return p.get("thread_source") or ""
-
-
-def desktop_sessions(since):
-    """Claude Desktop's own session files, by CLI session id."""
-    out = {}
-    pattern = os.path.join(os.path.expanduser(CLAUDE_DESKTOP_SESSIONS), "*", "*", "local_*.json")
-    for f in glob.glob(pattern):
-        try:
-            if os.path.getmtime(f) < since:
-                continue
-            with open(f) as fh:
-                d = json.load(fh)
-        except (OSError, ValueError):
-            continue
-        if d.get("cliSessionId"):
-            out[d["cliSessionId"]] = d
-    return out
-
-
-def _desktop_on_screen(rec):
-    """True if this Desktop session is the one on screen right now, so its new
-    answer has already been seen."""
-    host = ((rec.get("jump") or {}).get("target") or "").rsplit("/", 1)[-1]
-    if not host.startswith("local_") or _frontmost() != CLAUDE_BUNDLE:
-        return False
-    sessions = desktop_sessions(time.time() - RECENT).values()
-    focus = {d.get("sessionId"): d.get("lastFocusedAt") or 0 for d in sessions}
-    return bool(focus) and focus.get(host, -1) >= max(focus.values())
+def _first_line(text):
+    text = (text or "").strip() if isinstance(text, str) else ""
+    return text.splitlines()[0][:60] if text else ""
 
 
 def _frontmost():
@@ -402,30 +288,22 @@ def _frontmost():
     return out.rsplit("=", 1)[-1].strip().strip('"') or None
 
 
-def codex_threads(since, ids=()):
-    """Threads from Codex's state database, by thread id: those updated since
-    `since`, plus the ones in `ids` (sessions already shown, however old)."""
+def _sqlite_rows(pattern, query, params):
+    """Rows from the newest read-only SQLite file matching `pattern`, or [] if there's
+    none or its schema isn't what we expect (it's another app's, and may change)."""
     import sqlite3
     import urllib.request
-    dbs = glob.glob(os.path.join(os.path.expanduser(CODEX_HOME), "state_*.sqlite"))
+    dbs = glob.glob(os.path.expanduser(pattern))
     if not dbs:
-        return {}
-    db = max(dbs, key=lambda p: int("".join(c for c in os.path.basename(p) if c.isdigit()) or 0))
+        return []
+    db = max(dbs, key=os.path.getmtime)
     try:
-        con = sqlite3.connect("file:%s?mode=ro" % urllib.request.pathname2url(db),
-                              uri=True, timeout=1)
-        rows = con.execute(
-            "SELECT t.id, t.rollout_path, t.cwd, COALESCE(NULLIF(t.name, ''), t.title),"
-            " t.archived, t.originator, t.thread_source, r.first_unread_turn"
-            " FROM threads t LEFT JOIN thread_read_receipts r ON r.thread_id = t.id"
-            " WHERE t.updated_at_ms >= ? OR t.id IN (%s)" % ",".join("?" * len(ids)),
-            [int(since * 1000)] + list(ids)).fetchall()
+        con = sqlite3.connect("file:%s?mode=ro" % urllib.request.pathname2url(db), uri=True, timeout=1)
+        rows = con.execute(query, params).fetchall()
         con.close()
-    except Exception:  # the schema is Codex's own and may change
-        return {}
-    return {r[0]: {"rollout": r[1], "cwd": r[2], "title": r[3], "archived": bool(r[4]),
-                   "originator": r[5] or "", "source": r[6] or "", "unread": bool(r[7])}
-            for r in rows}
+        return rows
+    except Exception:
+        return []
 
 
 def _new_record(tool, sid, cwd):
@@ -434,69 +312,529 @@ def _new_record(tool, sid, cwd):
             "seen": True}
 
 
-def collect():
-    """All sessions worth showing, with hook state corrected by what the apps record.
-    Writes back what changed. Call with the lock held."""
-    now = time.time()
-    recs = {r.pop("_key"): r for r in all_records()}
-    before = {k: json.dumps(r, sort_keys=True) for k, r in recs.items()}
-    extra = {}  # per-session facts for this pass only
+def _terminal_or(bundle):
+    """Started from a terminal: bring that terminal forward. Otherwise the app."""
+    term = os.environ.get("__CFBundleIdentifier")
+    return {"kind": "app", "target": term or bundle}
 
-    for sid, d in desktop_sessions(now - RECENT).items():
-        key = "claude-" + _safe(sid)
-        active = (d.get("lastActivityAt") or 0) / 1000
-        if key not in recs:
-            if d.get("isArchived") or active < now - RECENT:
+
+# ---------------------------------------------------------------- agents
+#
+# One adapter per agent. Each says how to install its hooks, how to read its hook
+# events, how to get back to a session, and (optionally) what its own records say.
+# To add an agent, subclass Agent and add it to AGENTS.
+
+class Agent:
+    name = ""      # short id, used in record keys and hook commands
+    label = ""     # shown in the panel
+    bundle = ""    # the app's bundle id: its icon, and the app to bring forward
+
+    def translate(self, event, data):
+        """A hook event as a dict: kind (see the state machine), sid, and optionally
+        reason, detail, cwd, transcript, prompt. None to ignore it."""
+        raise NotImplementedError
+
+    def jump(self, sid, data):
+        return _terminal_or(self.bundle)
+
+    def turn(self, path):
+        """(state, reason, time) of the last turn in a transcript, or None."""
+        return None
+
+    def scan(self, recs, now, facts):
+        """Add or correct records from the agent's own records. `facts[key]` takes
+        {"focused": time you last opened it} or {"read": True}."""
+
+    def on_screen(self, rec):
+        """True if a turn that just finished was already on screen, so it's seen."""
+        return False
+
+    def hook_output(self, event):
+        """What the hook prints on stdout. Most agents want nothing."""
+        return None
+
+    def present(self):
+        """Whether this agent is on this Mac; install skips it if not."""
+        return True
+
+    def install(self):
+        pass
+
+    def uninstall(self):
+        pass
+
+
+def _claude_style_event(event, data, ask_tools=()):
+    """Translation shared by Claude Code and Codex, whose hook payloads match."""
+    tool = data.get("tool_name", "")
+    ev = {"sid": data.get("session_id") or data.get("thread_id") or "",
+          "cwd": data.get("cwd"), "transcript": data.get("transcript_path")}
+    if event == "UserPromptSubmit":
+        ev.update(kind="prompt", prompt=_first_line(data.get("prompt")))
+    elif event == "SessionStart":
+        ev.update(kind="start")
+    elif event in ("PreToolUse", "PermissionRequest") and tool in ask_tools:
+        # Claude Desktop sends PermissionRequest for its question tools too.
+        ev.update(kind="wait", reason="plan" if tool == "ExitPlanMode" else "question")
+    elif event == "PermissionRequest":
+        ev.update(kind="wait", reason="permission", detail=tool)
+    elif event == "Notification":
+        if data.get("notification_type") not in WAIT_NOTIFICATIONS:
+            return None
+        ev.update(kind="wait_hint")
+    elif event in ("PostToolUse", "PostToolUseFailure"):
+        ev.update(kind="tool_done")
+    elif event == "Stop":
+        ev.update(kind="turn_done")
+    elif event == "Interrupt":
+        ev.update(kind="interrupt")
+    elif event == "SessionEnd":
+        ev.update(kind="end")
+    else:
+        return None
+    return ev
+
+
+def _edit_json(path, fn):
+    data = {}
+    if os.path.exists(path):
+        with open(path) as f:
+            text = f.read()
+        data = json.loads(text) if text.strip() else {}
+        backup = "%s.bak-agent-status-%s" % (path, time.strftime("%Y%m%d-%H%M%S"))
+        with open(backup, "w") as f:
+            f.write(text)
+        print("  backup: " + backup)
+    fn(data)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+        f.write("\n")
+    os.replace(tmp, path)
+    print("  wrote:  " + path)
+
+
+def _strip_ours(hooks):
+    """Remove our entries from a Claude-style hooks mapping, leaving the rest alone."""
+    for event in list(hooks):
+        groups = []
+        for g in hooks[event]:
+            inner = [h for h in g.get("hooks", []) if HOOK_MARKER not in h.get("command", "")]
+            if inner:
+                g = dict(g, hooks=inner)
+                groups.append(g)
+            elif not g.get("hooks"):
+                groups.append(g)
+        if groups:
+            hooks[event] = groups
+        else:
+            del hooks[event]
+
+
+def _hook_cmd(tool, event=""):
+    return ('"%s" hook %s %s' % (SELF, tool, event)).rstrip()
+
+
+def _install_claude_style(path, tool, events):
+    def fn(data):
+        hooks = data.setdefault("hooks", {})
+        _strip_ours(hooks)
+        for event, matcher in events:
+            group = {"hooks": [{"type": "command", "command": _hook_cmd(tool), "timeout": 3}]}
+            if matcher:
+                group = dict({"matcher": matcher}, **group)
+            hooks.setdefault(event, []).append(group)
+    _edit_json(path, fn)
+
+
+def _uninstall_claude_style(path):
+    if not os.path.exists(path):
+        return
+
+    def fn(data):
+        _strip_ours(data.get("hooks", {}))
+        if data.get("hooks") == {}:
+            del data["hooks"]
+    _edit_json(path, fn)
+
+
+class Claude(Agent):
+    name, label, bundle = "claude", "Claude", CLAUDE_BUNDLE
+    SETTINGS = "~/.claude/settings.json"
+    PROJECTS = "~/.claude/projects"
+    DESKTOP_SESSIONS = "~/Library/Application Support/Claude/claude-code-sessions"
+    EVENTS = [
+        ("SessionStart", None), ("UserPromptSubmit", None),
+        ("PreToolUse", "AskUserQuestion|ExitPlanMode"), ("PermissionRequest", None),
+        ("Notification", "|".join(sorted(WAIT_NOTIFICATIONS))),
+        ("PostToolUse", None), ("PostToolUseFailure", None),
+        ("Stop", None), ("SessionEnd", None),
+    ]
+
+    def translate(self, event, data):
+        return _claude_style_event(event, data, ASK_TOOLS)
+
+    def jump(self, sid, data):
+        host = os.environ.get("CLAUDE_CODE_HOST_SESSION_ID", "")
+        # Child processes inherit the host id, so also require that this CLI is the
+        # one Desktop started, not a `claude` run inside a Desktop session.
+        if host.startswith("local_") and os.environ.get("CLAUDE_CODE_ENTRYPOINT") == "claude-desktop":
+            return {"kind": "url", "target": "claude://claude.ai/epitaxy/" + host, "fallback": self.bundle}
+        return _terminal_or(self.bundle)
+
+    def turn(self, path):
+        for raw in _tail(path):
+            if not raw.strip():
                 continue
-            rec = recs[key] = _new_record("claude", sid, d.get("cwd"))
-            found = glob.glob(os.path.join(os.path.expanduser(CLAUDE_PROJECTS), "*", sid + ".jsonl"))
-            if found:
-                rec["transcript"] = found[0]
-        rec = recs[key]
-        rec["jump"] = {"kind": "url", "target": "claude://claude.ai/epitaxy/" + d["sessionId"],
-                       "fallback": CLAUDE_BUNDLE}
-        if d.get("title"):
-            rec["name"] = d["title"]
-        if d.get("isArchived"):
-            rec["hidden"] = True
-        extra[key] = {"focused": (d.get("lastFocusedAt") or 0) / 1000}
-
-    known = [r["session_id"] for r in recs.values() if r.get("tool") == "codex" and r.get("session_id")]
-    for tid, t in codex_threads(now - RECENT, known).items():
-        key = "codex-" + _safe(tid)
-        if key not in recs:
-            if t["archived"] or t["source"] != "user" or t["originator"] == "codex_exec":
+            try:
+                d = json.loads(raw)
+            except ValueError:
                 continue
-            recs[key] = _new_record("codex", tid, t["cwd"])
-        rec = recs[key]
-        if t["rollout"]:
-            rec.setdefault("transcript", t["rollout"])
-        if t["title"]:
-            rec["name"] = t["title"].strip().splitlines()[0]
-        if t["archived"]:
-            rec["hidden"] = True
-        if t["originator"] == "Codex Desktop":
-            rec["jump"] = {"kind": "url", "target": "codex://threads/" + tid,
-                           "fallback": CODEX_BUNDLE}
-            extra[key] = {"read": not t["unread"]}
+            kind, ts = d.get("type"), _iso(d.get("timestamp"))
+            if kind == "system":
+                if d.get("subtype") in ("stop_hook_summary", "turn_duration"):
+                    return ("done", "", ts)
+            elif kind == "assistant":
+                if (d.get("message") or {}).get("stop_reason") in ("end_turn", "stop_sequence"):
+                    return ("done", "", ts)
+                return ("running", "", ts)
+            elif kind == "user" and not d.get("isMeta"):
+                if b"[Request interrupted by user" in raw:  # Esc, or a denied approval
+                    return ("idle", "interrupted", ts)
+                if b"<local-command-stdout>" in raw:  # a slash command that ran no turn
+                    continue
+                return ("running", "", ts)
+        return None
 
-    for key in list(recs):
-        rec = recs[key]
-        if rec.get("tool") == "codex":
+    def desktop_sessions(self, since):
+        """Claude Desktop's own session files, by CLI session id."""
+        out = {}
+        pattern = os.path.join(os.path.expanduser(self.DESKTOP_SESSIONS), "*", "*", "local_*.json")
+        for f in glob.glob(pattern):
+            try:
+                if os.path.getmtime(f) < since:
+                    continue
+                with open(f) as fh:
+                    d = json.load(fh)
+            except (OSError, ValueError):
+                continue
+            if d.get("cliSessionId"):
+                out[d["cliSessionId"]] = d
+        return out
+
+    def scan(self, recs, now, facts):
+        for sid, d in self.desktop_sessions(now - RECENT).items():
+            key = "claude-" + _safe(sid)
+            active = (d.get("lastActivityAt") or 0) / 1000
+            if key not in recs:
+                if d.get("isArchived") or active < now - RECENT:
+                    continue
+                rec = recs[key] = _new_record("claude", sid, d.get("cwd"))
+                found = glob.glob(os.path.join(os.path.expanduser(self.PROJECTS), "*", sid + ".jsonl"))
+                if found:
+                    rec["transcript"] = found[0]
+            rec = recs[key]
+            rec["jump"] = {"kind": "url", "target": "claude://claude.ai/epitaxy/" + d["sessionId"],
+                           "fallback": self.bundle}
+            if d.get("title"):
+                rec["name"] = d["title"]
+            if d.get("isArchived"):
+                rec["hidden"] = True
+            facts[key] = {"focused": (d.get("lastFocusedAt") or 0) / 1000}
+
+    def on_screen(self, rec):
+        """The Desktop session you were looking at when it finished."""
+        host = ((rec.get("jump") or {}).get("target") or "").rsplit("/", 1)[-1]
+        if not host.startswith("local_") or _frontmost() != self.bundle:
+            return False
+        sessions = self.desktop_sessions(time.time() - RECENT).values()
+        focus = {d.get("sessionId"): d.get("lastFocusedAt") or 0 for d in sessions}
+        return bool(focus) and focus.get(host, -1) >= max(focus.values())
+
+    def install(self):
+        _install_claude_style(os.path.expanduser(self.SETTINGS), self.name, self.EVENTS)
+
+    def uninstall(self):
+        _uninstall_claude_style(os.path.expanduser(self.SETTINGS))
+
+
+class Codex(Agent):
+    name, label, bundle = "codex", "Codex", CODEX_BUNDLE
+    HOOKS = "~/.codex/hooks.json"
+    EVENTS = [
+        ("SessionStart", None), ("UserPromptSubmit", None), ("PermissionRequest", None),
+        ("PostToolUse", None), ("Stop", None), ("Interrupt", None), ("SessionEnd", None),
+    ]
+
+    def translate(self, event, data):
+        if not data.get("transcript_path"):
+            # The Codex app runs short internal sessions of its own (summaries, safety
+            # review) that fire hooks too. They have no transcript and no thread you
+            # could open, so they aren't yours to track.
+            return None
+        return _claude_style_event(event, data)
+
+    def jump(self, sid, data):
+        # Seen in practice: "Codex Desktop".
+        if os.environ.get("CODEX_INTERNAL_ORIGINATOR_OVERRIDE", "").lower().endswith("desktop"):
+            return {"kind": "url", "target": "codex://threads/" + sid, "fallback": self.bundle}
+        return _terminal_or(self.bundle)
+
+    def turn(self, path):
+        for raw in _tail(path):
+            if b'"event_msg"' not in raw:
+                continue
+            try:
+                d = json.loads(raw)
+            except ValueError:
+                continue
+            kind, ts = (d.get("payload") or {}).get("type"), _iso(d.get("timestamp"))
+            if kind == "task_complete":
+                return ("done", "", ts)
+            if kind == "turn_aborted":
+                return ("idle", "interrupted", ts)
+            if kind in ("task_started", "turn_started"):
+                return ("running", "", ts)
+        return None
+
+    @staticmethod
+    def thread_source(path):
+        """Who started a thread, from its rollout's first line: "user" for one you
+        started, something else for a subagent; "" if the file isn't there yet."""
+        try:
+            with open(path, "rb") as f:
+                meta = json.loads(f.readline())
+        except (OSError, ValueError):
+            return ""
+        p = meta.get("payload") or {}
+        if isinstance(p.get("source"), dict) and "subagent" in p["source"]:
+            return "subagent"
+        return p.get("thread_source") or ""
+
+    def scan(self, recs, now, facts):
+        known = [r["session_id"] for r in recs.values() if r.get("tool") == "codex" and r.get("session_id")]
+        rows = _sqlite_rows(
+            os.path.join(CODEX_HOME, "state_*.sqlite"),
+            "SELECT t.id, t.rollout_path, t.cwd, COALESCE(NULLIF(t.name, ''), t.title),"
+            " t.archived, t.originator, t.thread_source, r.first_unread_turn"
+            " FROM threads t LEFT JOIN thread_read_receipts r ON r.thread_id = t.id"
+            " WHERE t.updated_at_ms >= ? OR t.id IN (%s)" % ",".join("?" * len(known)),
+            [int((now - RECENT) * 1000)] + known)
+        for tid, rollout, cwd, title, archived, originator, source, unread in rows:
+            key = "codex-" + _safe(tid)
+            if key not in recs:
+                if archived or source != "user" or originator == "codex_exec":
+                    continue
+                recs[key] = _new_record("codex", tid, cwd)
+            rec = recs[key]
+            if rollout:
+                rec.setdefault("transcript", rollout)
+            if title:
+                rec["name"] = title.strip().splitlines()[0]
+            if archived:
+                rec["hidden"] = True
+            if originator == "Codex Desktop":
+                rec["jump"] = {"kind": "url", "target": "codex://threads/" + tid, "fallback": self.bundle}
+                facts[key] = {"read": not unread}
+
+        for key in [k for k, r in recs.items() if r.get("tool") == "codex"]:
+            rec = recs[key]
             if not rec.get("transcript"):
-                # Left by an internal Codex app session (see cmd_hook): drop it.
+                # Left by an internal Codex app session (see translate): drop it.
                 remove(key)
                 del recs[key]
                 continue
             if not rec.get("thread_source"):  # retried until the rollout file exists
-                rec["thread_source"] = codex_thread_source(rec["transcript"])
+                rec["thread_source"] = self.thread_source(rec["transcript"])
             if rec["thread_source"] not in ("user", ""):
                 rec["hidden"] = True  # a subagent's thread, not one you started
 
+    def install(self):
+        _install_claude_style(os.path.expanduser(self.HOOKS), self.name, self.EVENTS)
+        print("\nCodex trust:")
+        if sys.stdin.isatty() and _codex_exe():
+            cmd_trust_codex()
+        else:
+            print("  Codex runs new hooks only after you trust them. Run:\n"
+                  "    %s trust-codex\n"
+                  "  or open Codex → Settings → Hooks → Review hooks." % _q(SELF))
+
+    def uninstall(self):
+        _uninstall_claude_style(os.path.expanduser(self.HOOKS))
+
+
+class Antigravity(Agent):
+    """Google Antigravity. Its hooks differ from Claude's: no prompt event (a model
+    invocation means it's working), camelCase payloads with no event name (we pass
+    it on the command line), and some events read a decision from stdout."""
+    name, label, bundle = "antigravity", "Antigravity", "com.google.antigravity"
+    HOOKS = "~/.gemini/config/hooks.json"
+    HOOK_NAME = "agent-status"
+    APP_DIRS = ("~/.gemini/antigravity", "~/.gemini/antigravity-ide", "~/.gemini/antigravity-cli")
+    # The tools Antigravity uses to ask you something.
+    ASK = {"ask_question": "question", "ask_permission": "permission"}
+    # The documented "carry on as normal" answers for events that read stdout.
+    NEUTRAL = {"PreToolUse": {"decision": "allow"}, "Stop": {"decision": "allow"}}
+
+    def translate(self, event, data):
+        sid = data.get("conversationId") or os.environ.get("ANTIGRAVITY_CONVERSATION_ID") or ""
+        roots = data.get("workspacePaths") or []
+        path = data.get("transcriptPath") or ""
+        ev = {"sid": sid, "cwd": data.get("cwd") or (roots[0] if roots else ""),
+              "transcript": os.path.expanduser(path) if path else ""}
+        tool = (data.get("toolCall") or {}).get("name", "")
+        if event == "SessionStart":
+            ev.update(kind="start")
+        elif event == "PreInvocation":
+            ev.update(kind="working")
+            if data.get("invocationNum") == 0:
+                ev["prompt"] = _first_line(data.get("lastUserInput"))
+        elif event == "PreToolUse" and tool in self.ASK:
+            ev.update(kind="wait", reason=self.ASK[tool])
+        elif event == "PostToolUse":
+            ev.update(kind="tool_done")
+        elif event == "Stop":
+            ev.update(kind="turn_done")
+        else:
+            return None
+        return ev
+
+    def jump(self, sid, data):
+        # No documented link to a single conversation: bring the app (or, for the
+        # CLI, its terminal) forward.
+        path = data.get("transcriptPath") or ""
+        if "antigravity-cli" in path:
+            return _terminal_or(self.bundle)
+        return {"kind": "app", "target": self.bundle}
+
+    @staticmethod
+    def app_dir(rec):
+        """The product's data folder (~/.gemini/antigravity, -ide or -cli), from the
+        transcript path: <dir>/brain/<conversation>/.system_generated/logs/..."""
+        path = rec.get("transcript") or ""
+        return path.split("/brain/")[0] if "/brain/" in path else ""
+
+    @staticmethod
+    def viewed(app_dir, cid):
+        """When you last looked at a conversation, from Antigravity's annotations."""
+        try:
+            with open(os.path.join(app_dir, "annotations", cid + ".pbtxt")) as f:
+                text = f.read()
+        except OSError:
+            return 0
+        import re
+        m = re.search(r"last_user_view_time:\s*\{\s*seconds:\s*(\d+)", text)
+        return int(m.group(1)) if m else 0
+
+    def turn(self, path):
+        """Each line of the transcript is one step. A step waiting on you has status
+        WAITING; a turn is over when the last step is a reply with no tool calls."""
+        for raw in _tail(path):
+            if not raw.strip():
+                continue
+            try:
+                d = json.loads(raw)
+            except ValueError:
+                continue
+            kind, status, ts = d.get("type"), d.get("status"), _iso(d.get("created_at"))
+            if status == "WAITING":
+                return ("waiting", "permission", ts)
+            if kind == "USER_INPUT":
+                return ("running", "", ts)
+            if kind == "PLANNER_RESPONSE" and status == "DONE" and not d.get("tool_calls"):
+                return ("done", "", ts)
+            if kind == "ERROR_MESSAGE":
+                return ("done", "", ts)
+            if status in ("CANCELED", "INTERRUPTED", "HALTED"):
+                return ("idle", "interrupted", ts)
+            return ("running", "", ts)
+        return None
+
+    def scan(self, recs, now, facts):
+        """Titles, which conversations are subagents', and when you last looked at
+        each, from Antigravity's own records."""
+        mine = {r["session_id"]: k for k, r in recs.items()
+                if r.get("tool") == self.name and r.get("session_id")}
+        if not mine:
+            return
+        for cid, key in mine.items():
+            d = self.app_dir(recs[key])
+            if d:
+                facts[key] = {"focused": self.viewed(d, cid)}
+        for d in self.APP_DIRS:
+            rows = _sqlite_rows(
+                os.path.join(d, "conversation_summaries.db"),
+                "SELECT conversation_id, title, nesting_depth FROM conversation_summaries"
+                " WHERE conversation_id IN (%s)" % ",".join("?" * len(mine)), list(mine))
+            for cid, title, depth in rows:
+                rec = recs[mine[cid]]
+                if title:
+                    rec["name"] = title
+                if depth:
+                    rec["hidden"] = True  # a subagent's conversation, not one you started
+
+    def on_screen(self, rec):
+        """The conversation you were looking at in Antigravity when it finished."""
+        d = self.app_dir(rec)
+        if not d or _frontmost() != self.bundle:
+            return False
+        views = {os.path.basename(f)[:-len(".pbtxt")]: 0
+                 for f in glob.glob(os.path.join(d, "annotations", "*.pbtxt"))}
+        views = {cid: self.viewed(d, cid) for cid in views}
+        return bool(views) and views.get(rec.get("session_id"), -1) >= max(views.values())
+
+    def hook_output(self, event):
+        return self.NEUTRAL.get(event, {})
+
+    def present(self):
+        return os.path.isdir(os.path.expanduser("~/.gemini")) or os.path.isdir("/Applications/Antigravity.app")
+
+    def install(self):
+        path = os.path.expanduser(self.HOOKS)
+
+        def handler(event):
+            return {"type": "command", "command": _hook_cmd(self.name, event), "timeout": 5}
+
+        def fn(data):
+            # Our own named entry; other hooks in the file are left alone.
+            data[self.HOOK_NAME] = {
+                "SessionStart": [handler("SessionStart")],
+                "PreInvocation": [handler("PreInvocation")],
+                "Stop": [handler("Stop")],
+                "PostToolUse": [{"matcher": "", "hooks": [handler("PostToolUse")]}],
+                # Only the tools that ask you something: our answer is "allow", and we
+                # don't want to be anywhere near the approval of anything else.
+                "PreToolUse": [{"matcher": "|".join(sorted(self.ASK)), "hooks": [handler("PreToolUse")]}],
+            }
+        _edit_json(path, fn)
+
+    def uninstall(self):
+        path = os.path.expanduser(self.HOOKS)
+        if os.path.exists(path):
+            _edit_json(path, lambda data: data.pop(self.HOOK_NAME, None))
+
+
+AGENTS = {a.name: a for a in (Claude(), Codex(), Antigravity())}
+
+
+# ---------------------------------------------------------------- collect
+
+def collect():
+    """All sessions worth showing, with hook state corrected by what the agents
+    record themselves. Writes back what changed. Call with the lock held."""
+    now = time.time()
+    recs = {r.pop("_key"): r for r in all_records()}
+    before = {k: json.dumps(r, sort_keys=True) for k, r in recs.items()}
+    facts = {}  # per-session facts for this pass only
+    for agent in AGENTS.values():
+        agent.scan(recs, now, facts)
+
     for key, rec in recs.items():
+        agent = AGENTS.get(rec.get("tool"))
         path = rec.get("transcript")
         mtime = os.path.getmtime(path) if path and os.path.exists(path) else 0
-        turn = (claude_turn if rec.get("tool") == "claude" else codex_turn)(path) if mtime else None
+        turn = agent.turn(path) if agent and mtime else None
         # The transcript wins only when it's newer than the last hook event; the
         # hook stays the authority on approvals and questions.
         if turn and (rec.get("state") is None or turn[2] > rec.get("updated_at", 0) + 2):
@@ -515,7 +853,7 @@ def collect():
             rec["state"] = "idle"
             rec["updated_at"] = int(mtime or now)
         # You looked at it in the app after it finished.
-        x = extra.get(key, {})
+        x = facts.get(key, {})
         if rec["state"] == "done" and not rec.get("seen"):
             if x.get("focused", 0) >= rec.get("updated_at", 0) or x.get("read"):
                 rec["seen"], rec["seen_at"] = True, int(now)
@@ -561,7 +899,8 @@ def cmd_open(key):
             rec["seen"], rec["seen_at"] = True, int(time.time())
             save(key, rec)
     jump = rec.get("jump") or {}
-    default = CLAUDE_BUNDLE if rec.get("tool") == "claude" else CODEX_BUNDLE
+    agent = AGENTS.get(rec.get("tool"))
+    default = agent.bundle if agent else CLAUDE_BUNDLE
     if jump.get("kind") == "url":
         # The deep link switches the app to the session; then bring the app forward.
         subprocess.call(["/usr/bin/open", jump["target"]])
@@ -590,8 +929,11 @@ def cmd_status():
     for r in records:
         kind = color_of(r)
         out["counts"][kind] += 1
+        agent = AGENTS.get(r.get("tool"))
         out["sessions"].append({
             "key": r["_key"], "tool": r.get("tool") or "", "kind": kind,
+            "app": agent.label if agent else r.get("tool") or "",
+            "bundle": agent.bundle if agent else "",
             "reason": r.get("reason") or "", "detail": r.get("detail") or "",
             "name": r.get("name") or r.get("title") or r.get("tool") or "",
             "cwd": r.get("cwd") or "", "updated_at": r.get("updated_at") or 0,
@@ -608,83 +950,6 @@ def cmd_dump():
 
 
 # ---------------------------------------------------------------- install
-
-CLAUDE_EVENTS = [
-    ("SessionStart", None), ("UserPromptSubmit", None),
-    ("PreToolUse", "AskUserQuestion|ExitPlanMode"), ("PermissionRequest", None),
-    ("Notification", "|".join(sorted(WAIT_NOTIFICATIONS))),
-    ("PostToolUse", None), ("PostToolUseFailure", None),
-    ("Stop", None), ("SessionEnd", None),
-]
-CODEX_EVENTS = [
-    ("SessionStart", None), ("UserPromptSubmit", None), ("PermissionRequest", None),
-    ("PostToolUse", None), ("Stop", None), ("Interrupt", None), ("SessionEnd", None),
-]
-
-
-def _hook_cmd(tool):
-    return '"%s" hook %s' % (SELF, tool)
-
-
-def _strip_ours(hooks):
-    """Remove our entries from a hooks mapping, leaving everybody else's untouched."""
-    for event in list(hooks):
-        groups = []
-        for g in hooks[event]:
-            inner = [h for h in g.get("hooks", []) if HOOK_MARKER not in h.get("command", "")]
-            if inner:
-                g = dict(g, hooks=inner)
-                groups.append(g)
-            elif not g.get("hooks"):
-                groups.append(g)
-        if groups:
-            hooks[event] = groups
-        else:
-            del hooks[event]
-
-
-def _edit_json(path, fn):
-    data = {}
-    if os.path.exists(path):
-        with open(path) as f:
-            text = f.read()
-        data = json.loads(text) if text.strip() else {}
-        backup = "%s.bak-agent-status-%s" % (path, time.strftime("%Y%m%d-%H%M%S"))
-        with open(backup, "w") as f:
-            f.write(text)
-        print("  backup: " + backup)
-    fn(data)
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    tmp = path + ".tmp"
-    with open(tmp, "w") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
-        f.write("\n")
-    os.replace(tmp, path)
-    print("  wrote:  " + path)
-
-
-def _install_hooks(path, tool, events):
-    def fn(data):
-        hooks = data.setdefault("hooks", {})
-        _strip_ours(hooks)
-        for event, matcher in events:
-            group = {"hooks": [{"type": "command", "command": _hook_cmd(tool), "timeout": 3}]}
-            if matcher:
-                group = dict({"matcher": matcher}, **group)
-            hooks.setdefault(event, []).append(group)
-    _edit_json(path, fn)
-
-
-def _uninstall_hooks(path):
-    if not os.path.exists(path):
-        return
-
-    def fn(data):
-        _strip_ours(data.get("hooks", {}))
-        if data.get("hooks") == {}:
-            del data["hooks"]
-    _edit_json(path, fn)
-
 
 def _swiftbar_plugin():
     """Where an older version installed its SwiftBar plugin, if anywhere."""
@@ -770,24 +1035,20 @@ def _xml(s):
 def cmd_install():
     os.makedirs(STATE_DIR, exist_ok=True)
     os.chmod(SELF, 0o755)
-    print("Claude Code:")
-    _install_hooks(os.path.expanduser("~/.claude/settings.json"), "claude", CLAUDE_EVENTS)
-    print("Codex:")
-    _install_hooks(os.path.expanduser("~/.codex/hooks.json"), "codex", CODEX_EVENTS)
+    for agent in AGENTS.values():
+        print(agent.label + ":")
+        if agent.present():
+            agent.install()
+        else:
+            print("  not found; skipped.")
+    print()
     if build_app():
         start_app()
     old = _swiftbar_plugin()
     if old:
         os.remove(old)
         print("  removed the old SwiftBar plugin: " + old)
-    print("\nCodex trust:")
-    if sys.stdin.isatty() and _codex_exe():
-        cmd_trust_codex()
-    else:
-        print("  Codex runs new hooks only after you trust them. Run:\n"
-              "    %s trust-codex\n"
-              "  or open Codex → Settings → Hooks → Review hooks." % _q(SELF))
-    print("\nDone. New Claude Code / Codex sessions pick up the hooks.")
+    print("\nDone. New sessions pick up the hooks.")
 
 
 # ---------------------------------------------------------------- codex trust
@@ -898,10 +1159,9 @@ def cmd_trust_codex():
 
 
 def cmd_uninstall():
-    print("Claude Code:")
-    _uninstall_hooks(os.path.expanduser("~/.claude/settings.json"))
-    print("Codex:")
-    _uninstall_hooks(os.path.expanduser("~/.codex/hooks.json"))
+    for agent in AGENTS.values():
+        print(agent.label + ":")
+        agent.uninstall()
     print("Menu bar app:")
     stop_app()
     old = _swiftbar_plugin()
@@ -916,10 +1176,16 @@ def cmd_uninstall():
 def main(argv):
     cmd = argv[1] if len(argv) > 1 else ""
     if cmd == "hook":
+        tool = argv[2] if len(argv) > 2 else "claude"
+        event = argv[3] if len(argv) > 3 else ""  # Antigravity doesn't name the event on stdin
         try:
-            cmd_hook(argv[2] if len(argv) > 2 else "claude")
+            cmd_hook(tool, sys.stdin.read(), event)
         except Exception:
             pass  # a hook must never break the agent
+        agent = AGENTS.get(tool)
+        out = agent.hook_output(event) if agent else None
+        if out is not None:
+            print(json.dumps(out))
         return 0
     if cmd == "open" and len(argv) > 2:
         cmd_open(argv[2])

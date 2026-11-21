@@ -2,11 +2,12 @@
 
 # Agent Status
 
-A macOS menu bar indicator for Claude Code and Codex sessions.
+A macOS menu bar indicator for Claude Code, Codex and Antigravity sessions.
 
 ![macOS 13+](https://img.shields.io/badge/macOS-13%2B-black?logo=apple)
 ![Claude Code](https://img.shields.io/badge/Claude%20Code-CLI%20%26%20Desktop-D97757)
 ![Codex](https://img.shields.io/badge/Codex-CLI%20%26%20app-412991)
+![Antigravity](https://img.shields.io/badge/Antigravity-experimental-4285F4)
 
 <img src="docs/images/menu-bar.png" width="340" alt="The menu bar badge in a light and a dark menu bar: a yellow dot with 1, a green dot with 2, a blue dot with 2">
 
@@ -20,7 +21,7 @@ The badge shows how many sessions are in each state:
 | 🟢 **Running** | working right now |
 | 🔵 **Unread** | finished, and you haven't looked at it yet |
 
-Click the badge to open the panel. Click a session to jump back to it in Claude Code Desktop, the Codex app, or the terminal it runs in.
+Click the badge to open the panel. Click a session to jump back to it in Claude Code Desktop, the Codex app, Antigravity, or the terminal it runs in.
 
 <p align="center">
   <img src="docs/images/panel.png" width="760" alt="The panel in light and dark mode: three status tiles, a Claude / Codex filter, and sessions grouped by Needs you, Unread and Running">
@@ -29,7 +30,7 @@ Click the badge to open the panel. Click a session to jump back to it in Claude 
 In the panel you can:
 
 - click a status tile to show only that state
-- filter by Claude or Codex
+- filter by agent, when more than one has sessions
 - clear every unread session with **Mark read**
 
 The panel follows your system appearance and language (English or Chinese).
@@ -38,7 +39,7 @@ The panel follows your system appearance and language (English or Chinese).
 
 - macOS 13 or later
 - Xcode Command Line Tools (`xcode-select --install`), for `python3` and `swiftc`
-- Claude Code (CLI or Desktop), Codex (CLI 0.169+ or app), or both
+- Any of: Claude Code (CLI or Desktop), Codex (CLI 0.169+ or app), Antigravity (2.34+)
 
 ## Install
 
@@ -49,7 +50,7 @@ git clone https://github.com/Handsomemikezzz/agent-monitor.git ~/agent-status
 
 The install script:
 
-1. Adds hooks to `~/.claude/settings.json` and `~/.codex/hooks.json`. It backs up both files first and leaves other hooks alone.
+1. Adds hooks to `~/.claude/settings.json`, `~/.codex/hooks.json` and `~/.gemini/config/hooks.json`. It backs up each file first and leaves other hooks alone.
 2. Builds the app into `build/Agent Status.app` and starts it at login with a LaunchAgent.
 3. Asks you to trust the hooks in Codex. Codex only runs hooks you've trusted.
 
@@ -59,6 +60,8 @@ If you skipped step 3, run this later, or use **Settings → Hooks → Review ho
 ~/agent-status/bin/agent-status trust-codex
 ```
 
+Antigravity reads its hooks when its background agent process starts. After installing, quit Antigravity with ⌘Q; if `agy --hub` processes are still running, end them (or log out and back in) before reopening it.
+
 To uninstall:
 
 ```sh
@@ -67,20 +70,20 @@ To uninstall:
 
 ## How it works
 
-1. Claude Code and Codex call `bin/agent-status hook` on each event. It writes one JSON file per session to `~/.agent-status/`.
+1. Each agent calls `bin/agent-status hook` on its events. It writes one JSON file per session to `~/.agent-status/`.
 2. The app watches that folder and updates as soon as a file changes.
 3. Some changes don't fire a hook, such as pressing Esc in Claude Code. To catch these, the app also checks session transcripts and the apps' own session records when you open the panel, and every 30 seconds while the badge shows any session. When nothing is shown, it does no periodic work. Each check takes about 0.1 seconds of CPU.
 
-| Event | Claude Code | Codex | State |
-|---|---|---|---|
-| Prompt sent | `UserPromptSubmit` | `UserPromptSubmit` | 🟢 Running |
-| Approval or question | `PermissionRequest`, `PreToolUse`, `Notification` | `PermissionRequest` | 🟡 Needs you |
-| Turn finished | `Stop` | `Stop` | 🔵 Unread |
-| Interrupted | transcript | `Interrupt` | hidden |
+| Event | Claude Code | Codex | Antigravity | State |
+|---|---|---|---|---|
+| Working | `UserPromptSubmit` | `UserPromptSubmit` | `PreInvocation` | 🟢 Running |
+| Approval or question | `PermissionRequest`, `PreToolUse`, `Notification` | `PermissionRequest` | `PreToolUse` (ask tools), transcript | 🟡 Needs you |
+| Turn finished | `Stop` | `Stop` | `Stop` | 🔵 Unread |
+| Interrupted | transcript | `Interrupt` | transcript | hidden |
 
 There are no timeouts. A session keeps its state until the session itself changes, so a long task stays **Running** and an unread result stays **Unread**. An unread session clears when you open it in the panel or in the app, or send it a new message. If the Claude or Codex app quits during a turn, that turn ends.
 
-Only sessions you started are shown. Codex subagents and the Codex app's internal background sessions are skipped.
+Only sessions you started are shown. Subagents, and the Codex app's internal background sessions, are skipped.
 
 See [DESIGN.md](DESIGN.md) (in Chinese) for the full design.
 
@@ -90,7 +93,7 @@ Everything stays on your Mac, and Agent Status makes no network requests. It onl
 
 - `~/.agent-status/`
 - its LaunchAgent
-- the hook entries in the two settings files above
+- the hook entries in the three settings files above
 - Codex's trust record for those hooks, after you agree
 
 ## Commands
@@ -107,8 +110,9 @@ To log every hook event to `~/.agent-status/debug.log`, run `touch ~/.agent-stat
 
 ## Limitations
 
-- Jumping back uses deep links that Claude and Codex don't document. If a link stops working, clicking still brings the app to the front.
+- Jumping back uses deep links that Claude and Codex don't document. If a link stops working, clicking still brings the app to the front. Antigravity has no link to a single conversation, so clicking brings Antigravity to the front.
+- Antigravity support is experimental: running and finished are tested with real sessions; "needs you" is built from its documentation and hasn't been seen in a real session yet.
 - Changes that don't fire a hook, like Esc in Claude Code, can take up to 30 seconds to show.
 - If an agent is killed without sending its end-of-session hook (for example, a terminal force-quit mid-turn), that session stays **Running** until it sends another event.
-- Transcripts, Claude Desktop's session files and Codex's database are internal formats and may change. If they can't be read, the hooks still work.
+- Transcripts, Claude Desktop's session files, Codex's database and Antigravity's records are internal formats and may change. If they can't be read, the hooks still work.
 - The app is built and signed on your Mac by `install.sh`. There's no prebuilt download.

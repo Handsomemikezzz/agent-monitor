@@ -84,6 +84,37 @@ g = S("codex-sub-1", base, tool="codex", meta={"thread_source": "subagent", "sou
 g.hook("UserPromptSubmit", prompt="explore"); g.line(TASK_DONE); g.hook("Stop")
 g.check("codex subagent thread", "hidden")
 
+# Antigravity: camelCase payloads, the event name on the command line, no prompt event.
+class Agy(S):
+    def __init__(s, sid):
+        S.__init__(s, sid, base, tool="antigravity")
+    def hook(s, ev, **kw):
+        data = dict(conversationId=s.sid, workspacePaths=["/tmp/p"], transcriptPath=s.tr)
+        data.update(kw)
+        out = subprocess.run([BIN, "hook", "antigravity", ev], input=json.dumps(data), text=True,
+                             env=s.env, capture_output=True).stdout
+        return json.loads(out) if out.strip() else None
+    def step(s, **d):
+        s.line(dict(d, created_at=iso()))
+a = Agy("agy-1")
+out = a.hook("PreInvocation", invocationNum=0, lastUserInput="refactor the parser")
+a.check("model invoked", "running/-/seen")
+if out != {}: FAILED.append("PreInvocation output"); print("FAIL PreInvocation output", out)
+out = a.hook("PreToolUse", toolCall={"name": "ask_question", "args": {}})
+a.check("asks you a question", "waiting/question/seen")
+if out != {"decision": "allow"}: FAILED.append("PreToolUse output"); print("FAIL PreToolUse output", out)
+a.hook("PostToolUse", toolCall={"name": "ask_question", "args": {}})
+a.check("question answered", "running/-/seen")
+out = a.hook("Stop", terminationReason="model_stop", fullyIdle=True)
+a.check("turn finished", "done/-/unseen")
+if out != {"decision": "allow"}: FAILED.append("Stop output"); print("FAIL Stop output", out)
+time.sleep(3)
+a.step(type="USER_INPUT", status="DONE"); a.step(type="RUN_COMMAND", status="WAITING")
+a.check("transcript: a step waits for approval", "waiting/permission/seen")
+time.sleep(3)
+a.step(type="PLANNER_RESPONSE", status="DONE", content="done")
+a.check("transcript: reply with no tool calls", "done/-/unseen")
+
 shutil.rmtree(D, ignore_errors=True)
 print("%d failed" % len(FAILED) if FAILED else "all passed")
 sys.exit(1 if FAILED else 0)

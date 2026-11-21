@@ -1,6 +1,6 @@
 # agent-status 设计
 
-在 macOS 菜单栏放一个状态灯，汇总 Claude Code 和 Codex 的会话状态。点击下拉菜单里的会话，可以跳回对应的应用。
+在 macOS 菜单栏放一个状态灯，汇总 Claude Code、Codex 和 Antigravity 的会话状态。点击下拉菜单里的会话，可以跳回对应的应用。
 
 | 颜色 | 含义 |
 |---|---|
@@ -23,10 +23,10 @@
 ## 架构
 
 ```
-Claude Code hooks ─┐                                   ~/.agent-status/
-                   ├─► bin/agent-status hook <tool> ─►   claude-<session_id>.json
-Codex hooks ───────┘   (从 stdin 读事件 JSON，           codex-<session_id>.json
-                        从环境变量读跳转信息)                    │
+Claude Code hooks ─┐                                       ~/.agent-status/
+Codex hooks ───────┼─► bin/agent-status hook <agent> ─►     <agent>-<session_id>.json
+Antigravity hooks ─┘   (适配器把事件翻译成通用事件，            │
+                        再交给同一个状态机)                     │
                                                                ▼
                                      菜单栏 App 监听目录 → agent-status status → 徽标 + 面板
                                                                │ 点击
@@ -126,14 +126,53 @@ Desktop 和 Codex App 退出时会给会话发 `SessionEnd`。会话本身保留
 
 **蓝色消失的情况：** 在该会话里发下一条消息（`UserPromptSubmit`）；从面板点进去；在 App 里点开它。不会因为时间到了自动消失。
 
-## 5. 仓库结构
+## 5. 适配器：怎么接入一个新的 agent
+
+`bin/agent-status` 里每个 agent 一个 `Agent` 子类，登记在 `AGENTS`。状态机只有一份（`next_state`），只认通用事件：
+
+| 通用事件 | 含义 | 状态 |
+|---|---|---|
+| `start` | 会话开始或恢复，本身不代表新一轮 | 不变（新会话由对话记录决定） |
+| `prompt` / `working` | 发了消息 / 模型在干活 | 运行中 |
+| `wait` | 要你审批、回答、确认计划（`reason` 区分） | 等你处理 |
+| `wait_hint` | 较弱的"等你"信号，只在没有更好信号时用 | 等你处理 |
+| `tool_done` | 工具结束（审批或提问已回应） | 运行中 |
+| `turn_done` | 一轮结束 | 已完成未读 |
+| `interrupt` | 被中断 | 不显示 |
+| `end` | 会话关闭 | 隐藏 |
+
+一个适配器提供：
+
+- `translate(event, data)`：把它的 hook 事件翻译成上面的通用事件，带上会话 ID、目录、对话记录路径、提示词。返回 `None` 表示忽略（比如 Codex App 的内部会话）。
+- `jump`：怎么跳回去。有对话级链接用链接，否则激活 App 或启动它的终端。
+- `turn(path)`：读对话记录末尾，判断最后一轮是结束、中断、等待还是在跑。
+- `scan`：读它自己的本地记录，补标题、归档、子代理、"你上次查看的时间"或已读标记。
+- `on_screen`：一轮结束时，你是不是正看着它（是就直接算已读）。
+- `hook_output`：有些 agent 要从钩子的 stdout 读决定，这里给出"照常继续"的答复。
+- `install` / `uninstall`：写入、移除它的钩子配置。
+
+菜单栏 App 不认识具体的 agent：`status` 输出里每个会话带 `app`（显示名）和 `bundle`（图标用），筛选栏按实际出现的 agent 生成。
+
+### Antigravity（实验性）
+
+- 钩子配置：`~/.gemini/config/hooks.json`，格式和 Claude 不同（顶层是"钩子名 → 事件"）。我们写在 `agent-status` 这个名字下，不动别的条目。
+- 钩子由后台的 `agy --hub` 进程执行，它只在启动时读配置。只退出 App 不够，要结束 `agy --hub` 进程（或重新登录）才会生效。
+- 事件：`SessionStart`、`PreInvocation`（模型开始工作，算运行中，没有"提交提示词"事件）、`PostInvocation`、`PreToolUse`、`PostToolUse`、`Stop`。payload 是 camelCase：`conversationId`、`cwd`、`workspacePaths`、`transcriptPath`、`lastUserInput`、`hookEventName`，环境变量里还有 `ANTIGRAVITY_CONVERSATION_ID`（`cwd`、`hookEventName` 和这个环境变量文档里没写，实测有）。
+- `PreToolUse` 和 `Stop` 必须在 stdout 给出 `decision`。我们一律答 `allow`，`PreToolUse` 只挂在 `ask_question|ask_permission` 上，不碰其他命令的审批。
+- 对话记录：`<数据目录>/brain/<id>/.system_generated/logs/transcript_full.jsonl`（文档写的是 `transcript.jsonl`，实测 hook 给的是 `_full`，格式一样），每行一步，有 `type`、`status`、`created_at`。最后一步是不带 `tool_calls` 的 `PLANNER_RESPONSE` 就是结束；状态 `WAITING` 当作等你处理（还没在真实会话里见到）。
+- 标题和子代理：`<数据目录>/conversation_summaries.db` 的 `conversation_summaries` 表（`title`、`nesting_depth`）。
+- 已读：`<数据目录>/annotations/<id>.pbtxt` 里的 `last_user_view_time`。
+- 跳转：注册了 `antigravity://`，但没有已知的对话级链接，只能把 App 切到前台。
+- 数据目录：App 是 `~/.gemini/antigravity`，IDE 是 `~/.gemini/antigravity-ide`，CLI 是 `~/.gemini/antigravity-cli`。
+
+## 6. 仓库结构
 
 ```
 agent-status/
 ├── DESIGN.md
 ├── README.md                 # 安装与使用（英文，面向开源）
 ├── bin/
-│   └── agent-status          # 单文件 Python：hook / status / open / install 等子命令
+│   └── agent-status          # 单文件 Python：适配器、状态机，以及 hook / status / open / install 等子命令
 ├── app/
 │   ├── main.swift            # 菜单栏 App
 │   └── Info.plist
@@ -146,7 +185,7 @@ agent-status/
 
 核心是一个只用标准库的 Python 脚本 `bin/agent-status`，用系统自带的 `/usr/bin/python3` 运行。hook、状态计算、跳转、安装都是它的子命令，不依赖 `jq`。
 
-## 6. 实测结果（2026-11-19）
+## 7. 实测结果（2026-11-19）
 
 1. ✅ Desktop 会触发 `PermissionRequest`。一次 AskUserQuestion 依次触发：`PreToolUse` → `PermissionRequest`（tool_name 也是 AskUserQuestion）→ `Notification(permission_prompt)` → 回答后触发 `PostToolUse`。所以 `PermissionRequest` 遇到提问类工具时要记成"提问"，不能记成"审批"。修改 `settings.json` 后，正在运行的 Desktop 会话会实时加载新 hook。
 2. ✅ Codex hook 收到的 `session_id`（UUIDv7）就是 threadId。`codex://threads/<id>` 能让 Codex App 切到对应会话。
@@ -157,7 +196,7 @@ agent-status/
 7. ✅ 子进程会继承 `CLAUDE_CODE_HOST_SESSION_ID`（比如在 Desktop 会话里启动的 codex 或 claude）。所以只有 `CLAUDE_CODE_ENTRYPOINT=claude-desktop` 时才生成 Desktop 会话的跳转链接。
 8. ✅ Codex App 里真实会话的 hook 环境变量是 `CODEX_INTERNAL_ORIGINATOR_OVERRIDE=Codex Desktop`（和从 App 代码里推断的 `codex_work_desktop` 不一样），判断时不区分大小写。App 退出时会给会话发 `SessionEnd(other)`；Claude Desktop 重启时也一样，重新打开会话时再发 `SessionStart(resume)`。
 
-## 7. 已知限制
+## 8. 已知限制
 
 - Claude 里按 Esc 中断、拒绝审批都不发 hook，要等下次刷新读到对话记录才从徽标上消失，最多 30 秒（打开面板时会立即刷新）。
 - 没有超时判断，所以如果终端里的 agent 在一轮中途被强制杀掉、没来得及发 `SessionEnd`，这个会话会一直显示运行中，直到它下一次有事件。
