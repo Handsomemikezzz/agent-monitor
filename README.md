@@ -69,7 +69,7 @@ To uninstall:
 
 1. Claude Code and Codex call `bin/agent-status hook` on each event. It writes one JSON file per session to `~/.agent-status/`.
 2. The app watches that folder and updates as soon as a file changes.
-3. Some changes don't fire a hook, such as pressing Esc in Claude Code. To catch these, the app also checks session transcripts and the apps' own session records every 30 seconds and whenever you open the panel.
+3. Some changes don't fire a hook, such as pressing Esc in Claude Code. To catch these, the app also checks session transcripts and the apps' own session records when you open the panel, and every 30 seconds while the badge shows any session. When nothing is shown, it does no periodic work. Each check takes about 0.1 seconds of CPU.
 
 | Event | Claude Code | Codex | State |
 |---|---|---|---|
@@ -78,11 +78,7 @@ To uninstall:
 | Turn finished | `Stop` | `Stop` | 🔵 Unread |
 | Interrupted | transcript | `Interrupt` | hidden |
 
-A session leaves the panel when:
-
-- **Unread:** you open it in the panel or in the app, or send it a new message
-- **Needs you / Unread:** nobody looks at it for 24 hours
-- **Running:** nothing happens in it for 30 minutes
+There are no timeouts. A session keeps its state until the session itself changes, so a long task stays **Running** and an unread result stays **Unread**. An unread session clears when you open it in the panel or in the app, or send it a new message. If the Claude or Codex app quits during a turn, that turn ends.
 
 Only sessions you started are shown. Codex subagents and the Codex app's internal background sessions are skipped.
 
@@ -113,5 +109,6 @@ To log every hook event to `~/.agent-status/debug.log`, run `touch ~/.agent-stat
 
 - Jumping back uses deep links that Claude and Codex don't document. If a link stops working, clicking still brings the app to the front.
 - Changes that don't fire a hook, like Esc in Claude Code, can take up to 30 seconds to show.
+- If an agent is killed without sending its end-of-session hook (for example, a terminal force-quit mid-turn), that session stays **Running** until it sends another event.
 - Transcripts, Claude Desktop's session files and Codex's database are internal formats and may change. If they can't be read, the hooks still work.
 - The app is built and signed on your Mac by `install.sh`. There's no prebuilt download.

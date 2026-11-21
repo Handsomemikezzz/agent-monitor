@@ -31,9 +31,10 @@ AGENT_LABEL = "io.github.agent-status"
 LAUNCH_AGENT = os.path.expanduser("~/Library/LaunchAgents/%s.plist" % AGENT_LABEL)
 HOOK_MARKER = "agent-status\" hook"  # how our hook commands are recognised on uninstall
 
-READ_TTL = 5 * 3600        # a grey (finished and seen) session is cleared after this
-RUNNING_TTL = 30 * 60      # a running session with no sign of life for this long counts as idle
-ATTENTION_TTL = 24 * 3600  # a red or blue session nobody looked at is cleared after this
+# A session's state only ever comes from the agents and the apps, never from a timer.
+# The one time limit is housekeeping: how far back to look for sessions we have no
+# record of yet, and when to delete records that are no longer shown.
+RECENT = 24 * 3600
 
 # What the apps themselves record, read to correct and complete what the hooks saw.
 CLAUDE_DESKTOP_SESSIONS = "~/Library/Application Support/Claude/claude-code-sessions"
@@ -171,13 +172,9 @@ def next_state(event, data, cur):
             return ("waiting", "permission")
         return None
     if event in ("PostToolUse", "PostToolUseFailure"):
-        # Clears an approval/question, and shows a running turn is still alive.
+        # Clears an approval or question, or shows an idle session is working again.
         # Never overrides a finished turn.
-        if st == "waiting":
-            return ("running", "")
-        if st == "idle" or (st == "running" and time.time() - cur.get("updated_at", 0) > 60):
-            return ("running", "")
-        return None
+        return ("running", "") if st in ("waiting", "idle") else None
     if event == "Stop":
         return ("done", "")
     if event == "Interrupt":
@@ -229,8 +226,13 @@ def cmd_hook(tool):
         if nxt == "ended":
             # Kept, hidden, so the transcript scan doesn't bring it back. Not for
             # Desktop / Codex app sessions: the apps end them on every quit and
-            # resume them later; archiving is what really closes them there.
+            # resume them later; archiving is what really closes them there. But
+            # the process is gone, so a turn that was running or waiting has stopped.
             if cur and (cur.get("jump") or {}).get("kind") == "url":
+                if cur.get("state") in ("running", "waiting"):
+                    cur.update(state="idle", reason="", updated_at=int(time.time()))
+                    cur.pop("detail", None)
+                    save(key, cur)
                 return
             if cur and not cur.get("hidden"):
                 cur["hidden"] = True
@@ -384,7 +386,7 @@ def _desktop_on_screen(rec):
     host = ((rec.get("jump") or {}).get("target") or "").rsplit("/", 1)[-1]
     if not host.startswith("local_") or _frontmost() != CLAUDE_BUNDLE:
         return False
-    sessions = desktop_sessions(time.time() - ATTENTION_TTL).values()
+    sessions = desktop_sessions(time.time() - RECENT).values()
     focus = {d.get("sessionId"): d.get("lastFocusedAt") or 0 for d in sessions}
     return bool(focus) and focus.get(host, -1) >= max(focus.values())
 
@@ -400,8 +402,9 @@ def _frontmost():
     return out.rsplit("=", 1)[-1].strip().strip('"') or None
 
 
-def codex_threads(since):
-    """Recent threads from Codex's state database, by thread id."""
+def codex_threads(since, ids=()):
+    """Threads from Codex's state database, by thread id: those updated since
+    `since`, plus the ones in `ids` (sessions already shown, however old)."""
     import sqlite3
     import urllib.request
     dbs = glob.glob(os.path.join(os.path.expanduser(CODEX_HOME), "state_*.sqlite"))
@@ -415,7 +418,8 @@ def codex_threads(since):
             "SELECT t.id, t.rollout_path, t.cwd, COALESCE(NULLIF(t.name, ''), t.title),"
             " t.archived, t.originator, t.thread_source, r.first_unread_turn"
             " FROM threads t LEFT JOIN thread_read_receipts r ON r.thread_id = t.id"
-            " WHERE t.updated_at_ms >= ?", (int(since * 1000),)).fetchall()
+            " WHERE t.updated_at_ms >= ? OR t.id IN (%s)" % ",".join("?" * len(ids)),
+            [int(since * 1000)] + list(ids)).fetchall()
         con.close()
     except Exception:  # the schema is Codex's own and may change
         return {}
@@ -438,11 +442,11 @@ def collect():
     before = {k: json.dumps(r, sort_keys=True) for k, r in recs.items()}
     extra = {}  # per-session facts for this pass only
 
-    for sid, d in desktop_sessions(now - ATTENTION_TTL).items():
+    for sid, d in desktop_sessions(now - RECENT).items():
         key = "claude-" + _safe(sid)
         active = (d.get("lastActivityAt") or 0) / 1000
         if key not in recs:
-            if d.get("isArchived") or active < now - READ_TTL:
+            if d.get("isArchived") or active < now - RECENT:
                 continue
             rec = recs[key] = _new_record("claude", sid, d.get("cwd"))
             found = glob.glob(os.path.join(os.path.expanduser(CLAUDE_PROJECTS), "*", sid + ".jsonl"))
@@ -457,7 +461,8 @@ def collect():
             rec["hidden"] = True
         extra[key] = {"focused": (d.get("lastFocusedAt") or 0) / 1000}
 
-    for tid, t in codex_threads(now - ATTENTION_TTL).items():
+    known = [r["session_id"] for r in recs.values() if r.get("tool") == "codex" and r.get("session_id")]
+    for tid, t in codex_threads(now - RECENT, known).items():
         key = "codex-" + _safe(tid)
         if key not in recs:
             if t["archived"] or t["source"] != "user" or t["originator"] == "codex_exec":
@@ -514,18 +519,16 @@ def collect():
         if rec["state"] == "done" and not rec.get("seen"):
             if x.get("focused", 0) >= rec.get("updated_at", 0) or x.get("read"):
                 rec["seen"], rec["seen_at"] = True, int(now)
-        if rec["state"] == "running" and now - max(rec.get("updated_at", 0), mtime) > RUNNING_TTL:
-            # Nothing has happened for a long time: the process probably went away.
-            rec["state"], rec["reason"] = "idle", ""
 
     shown = []
     for key, rec in recs.items():
-        kind = color_of(rec)
-        age = now - max(rec.get("updated_at", 0), rec.get("seen_at", 0))
-        ttl = READ_TTL if rec.get("hidden") or kind in ("read", "running") else ATTENTION_TTL
-        if age > ttl:
-            remove(key)
-            continue
+        # Housekeeping only: a record that isn't shown (seen, interrupted, closed)
+        # goes once its session is older than the scan window, so it can't come back.
+        # Shown sessions stay until their real state changes, however long that takes.
+        if rec.get("hidden") or color_of(rec) == "read":
+            if now - max(rec.get("updated_at", 0), rec.get("seen_at", 0)) > RECENT:
+                remove(key)
+                continue
         if json.dumps(rec, sort_keys=True) != before.get(key):
             save(key, rec)
         if not rec.get("hidden"):

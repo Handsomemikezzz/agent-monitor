@@ -6,7 +6,8 @@
 //
 // All the state logic lives in bin/agent-status; this app only draws. It runs
 // `agent-status status` when the state folder changes (the hooks write to it), when
-// the panel opens, and every 30 seconds (to pick up what the hooks can't see).
+// the panel opens, and, while the badge shows any session, every 30 seconds (to pick
+// up the few changes that send no hook).
 //
 // Built by `agent-status install`:
 //   swiftc -O -target <arch>-apple-macos13 -o "build/Agent Status.app/Contents/MacOS/AgentStatus" app/*.swift
@@ -141,7 +142,13 @@ final class Store: ObservableObject {
         bin = env["AGENT_STATUS_BIN"] ?? root.appendingPathComponent("bin/agent-status").path
         stateDir = env["AGENT_STATUS_DIR"] ?? (NSHomeDirectory() + "/.agent-status")
         watch()
-        timer = Timer.scheduledTimer(withTimeInterval: 30, repeats: true) { [weak self] _ in self?.reload() }
+        // Hooks cover most changes the moment they happen (see watch()). This timer only
+        // catches the few that send no hook, such as Esc in Claude Code or reading a
+        // session in the app, so it runs only while there's a session on the badge.
+        timer = Timer.scheduledTimer(withTimeInterval: 30, repeats: true) { [weak self] _ in
+            guard let self = self, self.snap.counts.values.contains(where: { $0 > 0 }) else { return }
+            self.reload()
+        }
         reload()
     }
 

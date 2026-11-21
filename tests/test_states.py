@@ -57,6 +57,21 @@ d.hook("SessionStart", source="resume"); d.check("app resumes it", "done/-/unsee
 # A session we never saw before, resumed after its turn already finished.
 n = S("new-1", base); n.line(END); time.sleep(1)
 n.hook("SessionStart", source="resume"); n.check("unknown session resumed", "done/-/unseen")
+# No timers: a long-running turn stays running, and an unread finish stays unread.
+def age(sess, hours):
+    p = os.path.join(D, "claude-%s.json" % sess.sid)
+    r = json.load(open(p)); r["updated_at"] -= hours * 3600; json.dump(r, open(p, "w"))
+lr = S("long-run-1", base)
+lr.hook("UserPromptSubmit", prompt="build"); age(lr, 2)
+lr.check("running for 2 hours, no events", "running/-/seen")
+lu = S("long-unread-1", base)
+lu.hook("UserPromptSubmit", prompt="x"); lu.hook("Stop"); age(lu, 30)
+lu.check("finished 30 hours ago, never looked at", "done/-/unseen")
+# A Desktop app quitting mid-turn ends that turn, but keeps the session.
+q = S("desk-quit-1", dict(base, CLAUDE_CODE_ENTRYPOINT="claude-desktop", CLAUDE_CODE_HOST_SESSION_ID="local_test-desk-quit"))
+q.hook("UserPromptSubmit", prompt="x"); q.hook("SessionEnd", reason="other")
+q.check("app quit while running", "idle/-/seen")
+
 # Codex: the app's own internal sessions (no transcript) and subagent threads stay out.
 TASK_DONE = {"type": "event_msg", "payload": {"type": "task_complete"}}
 c = S("codex-user-1", base, tool="codex", meta={"thread_source": "user", "source": "vscode"})
