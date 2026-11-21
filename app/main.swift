@@ -43,19 +43,38 @@ enum Kind: String, CaseIterable {
     /// List order: what needs you first.
     static let listOrder: [Kind] = [.waiting, .unread, .running]
 
-    var fill: NSColor { NSColor(hex: ["waiting": 0xFFE066, "running": 0xB2F2BB, "unread": 0xA5D8FF][rawValue]!) }
-    var edge: NSColor { NSColor(hex: ["waiting": 0xF59F00, "running": 0x2F9E44, "unread": 0x1971C2][rawValue]!) }
-    var tint: Color { Color(edge) }
-    var symbol: String {
-        ["waiting": "hand.raised.fill", "running": "bolt.fill", "unread": "checkmark.circle.fill"][rawValue]!
+    var dotNSColor: NSColor {
+        switch self {
+        case .waiting:
+            return NSColor(name: nil) {
+                $0.isDark
+                    ? NSColor(srgbRed: 1.00, green: 0.83, blue: 0.20, alpha: 1)
+                    : NSColor(srgbRed: 0.92, green: 0.70, blue: 0.03, alpha: 1)
+            }
+        case .running: return .systemGreen
+        case .unread: return .systemBlue
+        }
     }
+
+    var accentNSColor: NSColor {
+        switch self {
+        case .waiting:
+            return NSColor(name: nil) {
+                $0.isDark
+                    ? NSColor(srgbRed: 1.00, green: 0.83, blue: 0.20, alpha: 1)
+                    : NSColor(srgbRed: 0.72, green: 0.51, blue: 0.00, alpha: 1)
+            }
+        case .running: return .systemGreen
+        case .unread: return .systemBlue
+        }
+    }
+
+    var dotColor: Color { Color(nsColor: dotNSColor) }
+    var accentColor: Color { Color(nsColor: accentNSColor) }
 }
 
-extension NSColor {
-    convenience init(hex: Int) {
-        self.init(srgbRed: CGFloat((hex >> 16) & 0xff) / 255, green: CGFloat((hex >> 8) & 0xff) / 255,
-                  blue: CGFloat(hex & 0xff) / 255, alpha: 1)
-    }
+private extension NSAppearance {
+    var isDark: Bool { bestMatch(from: [.darkAqua, .aqua]) == .darkAqua }
 }
 
 // MARK: - Strings
@@ -95,7 +114,9 @@ enum L {
     static let emptyTitle = zh ? "一切就绪" : "All clear"
     static let emptyBody = zh ? "没有运行中或等你处理的会话" : "Nothing running or waiting for you."
     static let noneForTool = zh ? "这里没有会话" : "No sessions here."
+    static let noneForFilter = zh ? "当前筛选下没有会话" : "No matching sessions."
     static let seenAll = zh ? "全部标为已读" : "Mark all as seen"
+    static let seenAllShort = zh ? "全部已读" : "Mark read"
     static let folder = zh ? "打开状态目录" : "Open state folder"
     static let quit = zh ? "退出" : "Quit"
 }
@@ -178,48 +199,43 @@ final class Store: ObservableObject {
 
 // MARK: - Badge
 
-/// One rounded pill in three segments, each with its count. Drawn at the screen's scale.
+/// Three always-visible status lights (waiting · running · unread) with tabular counts.
 func badgeImage(_ snap: Snapshot) -> NSImage {
-    let segW: CGFloat = 21, height: CGFloat = 18, pillH: CGFloat = 17
-    let lineW: CGFloat = 1.5, radius: CGFloat = 6
-    let kinds = Kind.badgeOrder
-    let width = segW * CGFloat(kinds.count)
-    let image = NSImage(size: NSSize(width: width, height: height), flipped: false) { _ in
-        let pill = NSRect(x: lineW / 2, y: (height - pillH) / 2 + lineW / 2,
-                          width: width - lineW, height: pillH - lineW)
-        let outline = NSBezierPath(roundedRect: pill, xRadius: radius, yRadius: radius)
-        outline.lineWidth = lineW
-        for (i, kind) in kinds.enumerated() {
-            let slice = NSRect(x: CGFloat(i) * segW, y: 0, width: segW, height: height)
-            NSGraphicsContext.saveGraphicsState()
-            NSBezierPath(rect: slice).addClip()
-            kind.fill.setFill()
-            outline.fill()
-            kind.edge.setStroke()
-            outline.stroke()
-            NSGraphicsContext.restoreGraphicsState()
+    let dotSize: CGFloat = 6.5
+    let dotTextGap: CGFloat = 3.5
+    let itemGap: CGFloat = 7.5
+    let sidePad: CGFloat = 3
+    let height: CGFloat = 18
 
-            let n = snap.count(kind)
-            let text = n > 99 ? "99+" : String(n)
-            let size: CGFloat = text.count > 2 ? 9 : 11.5
-            let attrs: [NSAttributedString.Key: Any] = [
-                .font: roundedFont(size, .semibold),
-                .foregroundColor: NSColor(hex: 0x1E1E1E),
-            ]
-            let s = (text as NSString).size(withAttributes: attrs)
-            (text as NSString).draw(at: NSPoint(x: slice.midX - s.width / 2, y: pill.midY - s.height / 2),
-                                    withAttributes: attrs)
+    let items = Kind.badgeOrder.map { kind -> (Kind, Int, String, NSFont, NSSize) in
+        let count = snap.count(kind)
+        let text = count > 99 ? "99+" : String(count)
+        let font = NSFont.monospacedDigitSystemFont(ofSize: 12, weight: count > 0 ? .semibold : .regular)
+        let size = (text as NSString).size(withAttributes: [.font: font])
+        return (kind, count, text, font, size)
+    }
+    let contentWidth = items.reduce(CGFloat(0)) { $0 + dotSize + dotTextGap + $1.4.width }
+        + CGFloat(max(0, items.count - 1)) * itemGap
+    let totalWidth = sidePad * 2 + contentWidth
+
+    let image = NSImage(size: NSSize(width: ceil(totalWidth), height: height), flipped: false) { _ in
+        var x = sidePad
+        for (kind, count, text, font, size) in items {
+            let dotColor = count > 0 ? kind.dotNSColor : kind.dotNSColor.withAlphaComponent(0.60)
+            dotColor.setFill()
+            NSBezierPath(ovalIn: NSRect(x: x, y: (height - dotSize) / 2, width: dotSize, height: dotSize)).fill()
+            x += dotSize + dotTextGap
+
+            let textColor = count > 0 ? NSColor.labelColor : NSColor.labelColor.withAlphaComponent(0.45)
+            (text as NSString).draw(at: NSPoint(x: x, y: (height - size.height) / 2),
+                                    withAttributes: [.font: font, .foregroundColor: textColor])
+            x += size.width + itemGap
         }
         return true
     }
     image.isTemplate = false
+    image.cacheMode = .never
     return image
-}
-
-func roundedFont(_ size: CGFloat, _ weight: NSFont.Weight) -> NSFont {
-    let base = NSFont.systemFont(ofSize: size, weight: weight)
-    if let d = base.fontDescriptor.withDesign(.rounded), let f = NSFont(descriptor: d, size: size) { return f }
-    return base
 }
 
 // MARK: - Panel
@@ -237,75 +253,138 @@ struct Panel: View {
     @ObservedObject var store: Store
     let actions: Actions
     @State private var filter: Filter = .all
+    @State private var kindFilter: Kind? = nil
 
     private var sessions: [Session] {
-        store.snap.sessions.filter { filter == .all || $0.tool == filter.rawValue }
+        store.snap.sessions.filter { s in
+            (filter == .all || s.tool == filter.rawValue)
+                && (kindFilter == nil || s.kind == kindFilter?.rawValue)
+        }
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 16) {
+        VStack(alignment: .leading, spacing: 0) {
             header
-            HStack(spacing: 10) {
-                ForEach(Kind.badgeOrder, id: \.self) { StatTile(kind: $0, count: store.snap.count($0)) }
-            }
+            statusStrip
             if !store.snap.sessions.isEmpty {
-                Picker("", selection: $filter) {
-                    Text(L.all).tag(Filter.all)
-                    Text("Claude").tag(Filter.claude)
-                    Text("Codex").tag(Filter.codex)
-                }
-                .pickerStyle(.segmented)
-                .labelsHidden()
+                filterBar
             }
+            Divider()
             list
             Divider()
             footer
         }
-        .padding(18)
-        .frame(width: 380)
-        // The popover is translucent; without this, a dark window behind it greys the panel.
-        .background(Color(nsColor: .windowBackgroundColor).opacity(0.75))
+        .frame(width: 344)
     }
 
     private var header: some View {
-        HStack(spacing: 10) {
-            Text("Agent Status").font(.system(size: 18, weight: .bold))
+        HStack(spacing: 8) {
+            Text("Agent Status")
+                .font(.system(size: 13, weight: .semibold))
+                .foregroundStyle(.primary)
             Spacer()
-            HStack(spacing: 8) {
-                ToolCount(tool: "claude", count: store.snap.sessions.filter { $0.tool == "claude" }.count)
-                Text("·").foregroundStyle(.tertiary)
-                ToolCount(tool: "codex", count: store.snap.sessions.filter { $0.tool == "codex" }.count)
+            if kindFilter != nil {
+                Button(action: { kindFilter = nil }) {
+                    Text(L.all)
+                        .font(.system(size: 11.5, weight: .medium))
+                        .foregroundStyle(.secondary)
+                }
+                .buttonStyle(.plain)
             }
-            .padding(.horizontal, 10).padding(.vertical, 4)
-            .background(Capsule().fill(Color.primary.opacity(0.06)))
         }
+        .padding(.horizontal, 14)
+        .padding(.top, 12)
+        .padding(.bottom, 10)
+    }
+
+    private var statusStrip: some View {
+        HStack(spacing: 6) {
+            ForEach(Kind.badgeOrder, id: \.self) { kind in
+                StatusTile(
+                    kind: kind,
+                    count: store.snap.count(kind),
+                    selected: kindFilter == kind
+                ) {
+                    kindFilter = (kindFilter == kind) ? nil : kind
+                }
+            }
+        }
+        .padding(.horizontal, 14)
+        .padding(.bottom, 10)
+    }
+
+    private var filterBar: some View {
+        let claudeCount = store.snap.sessions.filter { $0.tool == "claude" }.count
+        let codexCount = store.snap.sessions.filter { $0.tool == "codex" }.count
+        return Picker("", selection: $filter) {
+            Text(L.all).tag(Filter.all)
+            Text(claudeCount > 0 ? "Claude \(claudeCount)" : "Claude").tag(Filter.claude)
+            Text(codexCount > 0 ? "Codex \(codexCount)" : "Codex").tag(Filter.codex)
+        }
+        .pickerStyle(.segmented)
+        .labelsHidden()
+        .controlSize(.small)
+        .padding(.horizontal, 14)
+        .padding(.bottom, 10)
     }
 
     @ViewBuilder private var list: some View {
         if store.snap.sessions.isEmpty {
-            VStack(spacing: 6) {
-                Image(systemName: "checkmark.seal.fill").font(.system(size: 30)).foregroundColor(Kind.running.tint)
-                Text(L.emptyTitle).font(.system(size: 14, weight: .semibold))
-                Text(L.emptyBody).font(.system(size: 12)).foregroundStyle(.secondary)
+            VStack(spacing: 5) {
+                Image(systemName: "checkmark.circle")
+                    .font(.system(size: 22, weight: .light))
+                    .foregroundStyle(.tertiary)
+                Text(L.emptyTitle)
+                    .font(.system(size: 13, weight: .medium))
+                    .foregroundStyle(.primary)
+                Text(L.emptyBody)
+                    .font(.system(size: 11.5))
+                    .foregroundStyle(.secondary)
+                    .multilineTextAlignment(.center)
             }
-            .frame(maxWidth: .infinity).padding(.vertical, 22)
+            .frame(maxWidth: .infinity)
+            .padding(.vertical, 22)
+            .padding(.horizontal, 16)
         } else if sessions.isEmpty {
-            Text(L.noneForTool).font(.system(size: 12)).foregroundStyle(.secondary)
-                .frame(maxWidth: .infinity).padding(.vertical, 18)
+            Text(kindFilter != nil ? L.noneForFilter : L.noneForTool)
+                .font(.system(size: 12))
+                .foregroundStyle(.secondary)
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 22)
         } else {
-            let content = VStack(alignment: .leading, spacing: 14) {
+            let content = VStack(alignment: .leading, spacing: 10) {
                 ForEach(Kind.listOrder, id: \.self) { kind in
                     let group = sessions.filter { $0.kind == kind.rawValue }
                     if !group.isEmpty {
-                        VStack(alignment: .leading, spacing: 6) {
-                            Text(L.kind(kind)).font(.system(size: 13, weight: .semibold)).foregroundStyle(.secondary)
-                            ForEach(group) { s in SessionRow(session: s) { actions.open(s) } }
+                        VStack(alignment: .leading, spacing: 2) {
+                            HStack(spacing: 5) {
+                                Circle().fill(kind.dotColor).frame(width: 6.5, height: 6.5)
+                                Text(L.kind(kind))
+                                    .font(.system(size: 11, weight: .medium))
+                                    .foregroundStyle(.secondary)
+                                Spacer()
+                                Text("\(group.count)")
+                                    .font(.system(size: 11))
+                                    .monospacedDigit()
+                                    .foregroundStyle(.tertiary)
+                            }
+                            .padding(.horizontal, 8)
+                            .padding(.top, 2)
+                            .padding(.bottom, 3)
+
+                            ForEach(group) { s in
+                                SessionRow(session: s) { actions.open(s) }
+                            }
                         }
                     }
                 }
             }
-            if sessions.count > 5 {
-                ScrollView { content.padding(.trailing, 4) }.frame(height: 360)
+            .padding(.horizontal, 6)
+            .padding(.vertical, 8)
+
+            if sessions.count > 6 {
+                ScrollView(.vertical, showsIndicators: true) { content }
+                    .frame(height: 340)
             } else {
                 content
             }
@@ -313,39 +392,70 @@ struct Panel: View {
     }
 
     private var footer: some View {
-        HStack(spacing: 6) {
-            IconButton(symbol: "checkmark.circle", help: L.seenAll, action: actions.seenAll)
-                .disabled(store.snap.count(.unread) == 0)
-            IconButton(symbol: "folder", help: L.folder, action: actions.openFolder)
-            Spacer()
-            Button(action: actions.quit) {
-                Text(L.quit).font(.system(size: 13, weight: .medium))
-                    .padding(.horizontal, 14).padding(.vertical, 5)
-                    .background(RoundedRectangle(cornerRadius: 7).fill(Color.primary.opacity(0.08)))
+        HStack(spacing: 4) {
+            if store.snap.count(.unread) > 0 {
+                FooterButton(symbol: "checkmark.circle", label: L.seenAllShort, help: L.seenAll, action: actions.seenAll)
             }
-            .buttonStyle(.plain)
+            FooterButton(symbol: "folder", label: nil, help: L.folder, action: actions.openFolder)
+            Spacer()
+            FooterButton(symbol: nil, label: L.quit, help: nil, action: actions.quit)
         }
+        .padding(.horizontal, 8)
+        .padding(.vertical, 6)
     }
 }
 
-struct StatTile: View {
+struct StatusTile: View {
     let kind: Kind
     let count: Int
+    let selected: Bool
+    let action: () -> Void
+    @State private var hover = false
+
+    private var active: Bool { count > 0 || selected }
+
+    private var fillColor: Color {
+        if selected { return kind.dotColor.opacity(0.16) }
+        if count > 0 { return kind.dotColor.opacity(hover ? 0.14 : 0.10) }
+        return Color.primary.opacity(hover ? 0.06 : 0.035)
+    }
+
+    private var strokeColor: Color {
+        if selected { return kind.dotColor.opacity(0.65) }
+        if count > 0 { return kind.dotColor.opacity(0.28) }
+        return Color.primary.opacity(0.08)
+    }
+
+    private var strokeWidth: CGFloat {
+        if selected { return 1.25 }
+        return count > 0 ? 0.75 : 0.5
+    }
+
     var body: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            HStack(spacing: 5) {
-                Image(systemName: kind.symbol).font(.system(size: 11, weight: .semibold))
-                Text(L.kind(kind)).font(.system(size: 12, weight: .medium)).lineLimit(1)
+        Button(action: action) {
+            VStack(alignment: .leading, spacing: 4) {
+                HStack(spacing: 5) {
+                    Circle().fill(kind.dotColor).frame(width: 7, height: 7)
+                    Text(L.kind(kind))
+                        .font(.system(size: 11, weight: .medium))
+                        .foregroundStyle(active ? kind.accentColor : .secondary)
+                        .lineLimit(1)
+                }
+                Text("\(count)")
+                    .font(.system(size: 18, weight: .semibold))
+                    .monospacedDigit()
+                    .foregroundStyle(active ? .primary : .tertiary)
             }
-            .foregroundColor(kind.tint)
-            Text("\(count)")
-                .font(.system(size: 26, weight: .bold, design: .rounded))
-                .foregroundColor(count == 0 ? .secondary : kind.tint)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.horizontal, 10)
+            .padding(.vertical, 8)
+            .background(RoundedRectangle(cornerRadius: 8, style: .continuous).fill(fillColor))
+            .overlay(RoundedRectangle(cornerRadius: 8, style: .continuous).stroke(strokeColor, lineWidth: strokeWidth))
+            .contentShape(Rectangle())
         }
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .padding(.horizontal, 12).padding(.vertical, 10)
-        .background(RoundedRectangle(cornerRadius: 12).fill(Color(kind.fill).opacity(0.28)))
-        .overlay(RoundedRectangle(cornerRadius: 12).stroke(kind.tint.opacity(0.25), lineWidth: 1))
+        .buttonStyle(.plain)
+        .animation(.easeOut(duration: 0.1), value: hover)
+        .onHover { hover = $0 }
     }
 }
 
@@ -358,47 +468,56 @@ struct SessionRow: View {
 
     var body: some View {
         Button(action: action) {
-            HStack(spacing: 10) {
-                AppIcon(tool: session.tool, size: 30)
-                VStack(alignment: .leading, spacing: 3) {
-                    Text(session.name).font(.system(size: 13, weight: .semibold)).lineLimit(1)
-                    HStack(spacing: 5) {
-                        Circle().fill(kind.tint).frame(width: 6, height: 6)
-                        Text(L.status(session)).foregroundColor(kind.tint).lineLimit(1)
+            HStack(alignment: .center, spacing: 9) {
+                AppIcon(tool: session.tool, size: 22)
+                VStack(alignment: .leading, spacing: 2) {
+                    HStack(alignment: .firstTextBaseline, spacing: 6) {
+                        Text(session.name)
+                            .font(.system(size: 12.5, weight: .medium))
+                            .foregroundStyle(.primary)
+                            .lineLimit(1)
+                        Spacer(minLength: 4)
                         TimelineView(.periodic(from: .now, by: 30)) { _ in
-                            Text("· " + L.ago(session.updated_at)).foregroundStyle(.secondary)
+                            Text(L.ago(session.updated_at))
+                                .font(.system(size: 11))
+                                .monospacedDigit()
+                                .foregroundStyle(.tertiary)
                         }
                     }
-                    .font(.system(size: 11, weight: .medium))
-                    if !session.prompt.isEmpty {
-                        Text(session.prompt).font(.system(size: 11)).foregroundStyle(.secondary).lineLimit(1)
+                    if kind == .waiting {
+                        Text(L.status(session))
+                            .font(.system(size: 11.5, weight: .medium))
+                            .foregroundStyle(kind.accentColor)
+                            .lineLimit(1)
+                        if !session.prompt.isEmpty {
+                            Text(session.prompt)
+                                .font(.system(size: 11))
+                                .foregroundStyle(.tertiary)
+                                .lineLimit(1)
+                        }
+                    } else {
+                        Text(session.prompt.isEmpty ? L.status(session) : session.prompt)
+                            .font(.system(size: 11.5))
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
                     }
                 }
-                Spacer(minLength: 4)
-                Image(systemName: "arrow.up.forward")
-                    .font(.system(size: 11, weight: .semibold))
-                    .foregroundStyle(.secondary)
-                    .opacity(hover ? 1 : 0)
+                Image(systemName: "chevron.right")
+                    .font(.system(size: 9.5, weight: .semibold))
+                    .foregroundStyle(.tertiary)
+                    .opacity(hover ? 0.8 : 0)
+                    .frame(width: 8)
             }
-            .padding(.horizontal, 10).padding(.vertical, 8)
+            .padding(.horizontal, 8)
+            .padding(.vertical, 6)
             .frame(maxWidth: .infinity, alignment: .leading)
-            .background(RoundedRectangle(cornerRadius: 10).fill(Color.primary.opacity(hover ? 0.09 : 0.04)))
+            .background(RoundedRectangle(cornerRadius: 6, style: .continuous).fill(Color.primary.opacity(hover ? 0.06 : 0)))
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
+        .animation(.easeOut(duration: 0.1), value: hover)
         .onHover { hover = $0 }
         .help(session.cwd)
-    }
-}
-
-struct ToolCount: View {
-    let tool: String
-    let count: Int
-    var body: some View {
-        HStack(spacing: 4) {
-            AppIcon(tool: tool, size: 14)
-            Text("\(count)").font(.system(size: 12, weight: .semibold, design: .rounded)).foregroundStyle(.secondary)
-        }
     }
 }
 
@@ -414,8 +533,9 @@ struct AppIcon: View {
         } else {
             Image(systemName: tool == "claude" ? "sparkle" : "chevron.left.forwardslash.chevron.right")
                 .font(.system(size: size * 0.55, weight: .semibold))
+                .foregroundStyle(.secondary)
                 .frame(width: size, height: size)
-                .background(RoundedRectangle(cornerRadius: size * 0.25).fill(Color.primary.opacity(0.08)))
+                .background(RoundedRectangle(cornerRadius: size * 0.24, style: .continuous).fill(.quaternary))
         }
     }
 
@@ -429,24 +549,39 @@ struct AppIcon: View {
     }
 }
 
-struct IconButton: View {
-    let symbol: String
-    let help: String
+struct FooterButton: View {
+    let symbol: String?
+    let label: String?
+    let help: String?
     let action: () -> Void
     @State private var hover = false
-    @Environment(\.isEnabled) private var enabled
 
     var body: some View {
         Button(action: action) {
-            Image(systemName: symbol)
-                .font(.system(size: 15, weight: .medium))
-                .frame(width: 30, height: 26)
-                .background(RoundedRectangle(cornerRadius: 7).fill(Color.primary.opacity(hover && enabled ? 0.08 : 0)))
+            HStack(spacing: 4) {
+                if let symbol {
+                    Image(systemName: symbol).font(.system(size: 12, weight: .medium))
+                }
+                if let label {
+                    Text(label).font(.system(size: 12, weight: .regular))
+                }
+            }
+            .foregroundStyle(hover ? .primary : .secondary)
+            .padding(.horizontal, label == nil ? 7 : 8)
+            .padding(.vertical, 4)
+            .background(RoundedRectangle(cornerRadius: 5, style: .continuous).fill(Color.primary.opacity(hover ? 0.06 : 0)))
+            .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
-        .foregroundStyle(enabled ? .primary : .tertiary)
+        .animation(.easeOut(duration: 0.1), value: hover)
         .onHover { hover = $0 }
-        .help(help)
+        .optionalHelp(help)
+    }
+}
+
+private extension View {
+    @ViewBuilder func optionalHelp(_ text: String?) -> some View {
+        if let text { help(text) } else { self }
     }
 }
 
