@@ -12,11 +12,16 @@ base.pop("CLAUDE_CODE_HOST_SESSION_ID", None)
 os.makedirs(D, exist_ok=True)
 def iso(): return time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime())
 class S:
-    def __init__(s, sid, env):
-        s.sid, s.env = sid, env; s.tr = os.path.join(D, sid + ".jsonl"); open(s.tr, "w").close()
+    def __init__(s, sid, env, tool="claude", meta=None):
+        s.sid, s.env, s.tool = sid, env, tool; s.tr = os.path.join(D, sid + ".jsonl")
+        with open(s.tr, "w") as f:
+            if meta is not None:  # a Codex rollout starts with its session_meta line
+                f.write(json.dumps({"type": "session_meta", "payload": meta}) + "\n")
     def line(s, d): open(s.tr, "a").write(json.dumps(dict(d, timestamp=iso())) + "\n")
     def hook(s, ev, **kw):
-        subprocess.run([BIN, "hook", "claude"], input=json.dumps(dict(hook_event_name=ev, session_id=s.sid, cwd="/tmp/p", transcript_path=s.tr, **kw)), text=True, env=s.env)
+        data = dict(hook_event_name=ev, session_id=s.sid, cwd="/tmp/p", transcript_path=s.tr)
+        data.update(kw)
+        subprocess.run([BIN, "hook", s.tool], input=json.dumps(data), text=True, env=s.env)
     def state(s):
         for r in json.loads(subprocess.run([BIN, "dump"], capture_output=True, text=True, env=base).stdout):
             if r["session_id"] == s.sid and not r.get("hidden"):
@@ -52,6 +57,17 @@ d.hook("SessionStart", source="resume"); d.check("app resumes it", "done/-/unsee
 # A session we never saw before, resumed after its turn already finished.
 n = S("new-1", base); n.line(END); time.sleep(1)
 n.hook("SessionStart", source="resume"); n.check("unknown session resumed", "done/-/unseen")
+# Codex: the app's own internal sessions (no transcript) and subagent threads stay out.
+TASK_DONE = {"type": "event_msg", "payload": {"type": "task_complete"}}
+c = S("codex-user-1", base, tool="codex", meta={"thread_source": "user", "source": "vscode"})
+c.hook("UserPromptSubmit", prompt="x"); c.line(TASK_DONE); c.hook("Stop")
+c.check("codex thread you started", "done/-/unseen")
+i = S("codex-internal-1", base, tool="codex")
+i.hook("UserPromptSubmit", prompt="# Overview", transcript_path=None); i.hook("Stop", transcript_path=None)
+i.check("codex app internal session", "hidden")
+g = S("codex-sub-1", base, tool="codex", meta={"thread_source": "subagent", "source": {"subagent": {"thread_spawn": {}}}})
+g.hook("UserPromptSubmit", prompt="explore"); g.line(TASK_DONE); g.hook("Stop")
+g.check("codex subagent thread", "hidden")
 
 shutil.rmtree(D, ignore_errors=True)
 print("%d failed" % len(FAILED) if FAILED else "all passed")

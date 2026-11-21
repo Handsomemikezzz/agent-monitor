@@ -102,6 +102,8 @@ There's no daemon and no polling of the agents. Their own hooks write one small 
 
 The Claude and Codex apps send `SessionEnd` every time they quit and `SessionStart` when they reopen a session, so for app sessions neither changes the state; archiving does.
 
+Only sessions you started are counted. The Codex app also runs short internal sessions of its own (summaries, safety review) that fire the same hooks but have no transcript and no thread you could open, and Codex subagents get threads of their own; both are skipped.
+
 **Some changes send no hook at all:** pressing Esc in Claude Code, denying an approval, or a session that hasn't fired a hook since you installed. So for recently active sessions the app also reads:
 
 - **The end of each transcript** (`~/.claude/projects/…`, `~/.codex/sessions/…`): did the last turn finish, get interrupted, or is it still going? When the transcript is newer than the last hook event, it wins. Approvals and questions only ever come from hooks.

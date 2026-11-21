@@ -215,6 +215,11 @@ def cmd_hook(tool):
     sid = data.get("session_id") or data.get("thread_id") or ""
     if not sid or not event:
         return
+    if tool == "codex" and not data.get("transcript_path"):
+        # The Codex app runs short internal sessions of its own (summaries, safety
+        # review) that fire hooks too. They have no transcript and no thread you
+        # could open, so they aren't yours to track.
+        return
     key = "%s-%s" % (tool, _safe(sid))
     with Lock():
         cur = load(key)
@@ -342,6 +347,20 @@ def codex_turn(path):
     return None
 
 
+def codex_thread_source(path):
+    """Who started a Codex thread, from its rollout's first line: "user" for one you
+    started, something else for a subagent; "" if the file isn't there yet."""
+    try:
+        with open(path, "rb") as f:
+            meta = json.loads(f.readline())
+    except (OSError, ValueError):
+        return ""
+    p = meta.get("payload") or {}
+    if isinstance(p.get("source"), dict) and "subagent" in p["source"]:
+        return "subagent"
+    return p.get("thread_source") or ""
+
+
 def desktop_sessions(since):
     """Claude Desktop's own session files, by CLI session id."""
     out = {}
@@ -455,6 +474,19 @@ def collect():
             rec["jump"] = {"kind": "url", "target": "codex://threads/" + tid,
                            "fallback": CODEX_BUNDLE}
             extra[key] = {"read": not t["unread"]}
+
+    for key in list(recs):
+        rec = recs[key]
+        if rec.get("tool") == "codex":
+            if not rec.get("transcript"):
+                # Left by an internal Codex app session (see cmd_hook): drop it.
+                remove(key)
+                del recs[key]
+                continue
+            if not rec.get("thread_source"):  # retried until the rollout file exists
+                rec["thread_source"] = codex_thread_source(rec["transcript"])
+            if rec["thread_source"] not in ("user", ""):
+                rec["hidden"] = True  # a subagent's thread, not one you started
 
     for key, rec in recs.items():
         path = rec.get("transcript")

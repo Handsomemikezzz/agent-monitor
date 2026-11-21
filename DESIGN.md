@@ -43,7 +43,8 @@ Codex hooks ───────┘   (从 stdin 读事件 JSON，           co
 | Claude 跳转链接 | `claude://claude.ai/epitaxy/local_<uuid>`（App 自己对外给的就是这种链接）。另一种 `claude://code/continue?session=local_<uuid>` 也能用，但受 App 的"入口"设置控制。两种都要 `local_` 格式的 ID，不能用 CLI 的 UUID | Claude.app URL 处理代码；已实测在两个会话之间跳转 |
 | Codex App | `/Applications/ChatGPT.app`，bundle id 是 `com.openai.codex`，注册了 `codex://` | Info.plist |
 | Codex 跳转链接 | `codex://threads/<threadId>` | ChatGPT.app 代码 |
-| Codex App 会话标识 | App 里会话的 hook 环境变量 `CODEX_INTERNAL_ORIGINATOR_OVERRIDE=Codex Desktop`；hook 的 `transcript_path` 是 null | 实测（debug.log） |
+| Codex App 会话标识 | App 里会话的 hook 环境变量 `CODEX_INTERNAL_ORIGINATOR_OVERRIDE=Codex Desktop` | 实测（debug.log） |
+| Codex App 内部会话 | App 会自己开一些很短的后台会话（提示词是 `# Overview` 的概要、"You are an expert at upholding safety…" 的安全审查），同样触发 hook、环境变量也一样，但 `transcript_path` 是 null，不在 `threads` 表里，用 `codex://threads/<id>` 打开会显示"Chat unavailable on this computer"。你自己的会话从第一个事件起就带 `transcript_path` | 实测（debug.log、state_5.sqlite） |
 | Codex hooks | `hooks` 已是 stable。CLI 0.169 支持 `SessionStart`、`UserPromptSubmit`、`PreToolUse`、`PermissionRequest`、`PostToolUse`、`Stop`、`Interrupt`、`SessionEnd`、`SubagentStop` | `codex features list`、二进制字符串 |
 | Codex `notify` | 已被 Computer Use 占用，只能挂一个程序，**不使用** | `~/.codex/config.toml` |
 
@@ -63,6 +64,7 @@ Codex hooks ───────┘   (从 stdin 读事件 JSON，           co
 - 不监听 `SubagentStop`，否则子任务结束时会提前变色。
 - Claude 的 `Notification` 里 `idle_prompt` 不处理（它表示空闲超过 60 秒，不是新事件）。
 - `SessionEnd` 后记录保留但隐藏，免得下面的扫描又把它找回来。
+- Codex 事件没有 `transcript_path` 的直接忽略（App 的内部会话）。有对话记录的，再看 rollout 第一行 `session_meta`：`thread_source` 不是 `user`、或 `source` 里有 `subagent` 的是子代理线程，隐藏。
 - Claude Desktop 和 Codex App 每次退出都会给所有会话发 `SessionEnd`，重新打开某个会话时发 `SessionStart(resume)`。所以对 App 会话（`jump` 是深链接的）忽略 `SessionEnd`，以归档为准。没见过的会话收到 `SessionStart` 时，状态从对话记录里读，不默认成空闲。
 
 ### 用应用自己的记录校正
