@@ -12,14 +12,13 @@ The menu bar shows one small pill with three counts:
 
 Sessions you've already seen, and interrupted ones, aren't shown.
 
-Click the badge to see every session. Click a session to jump straight back to it in Claude Code Desktop or the Codex app (or to the terminal it runs in).
+Click the badge for a panel with the three counts and the sessions behind them, filterable by Claude or Codex. Click a session to jump straight back to it in Claude Code Desktop or the Codex app (or to the terminal it runs in).
 
-There's no daemon. The agents' own hooks write one small JSON file per session and ask SwiftBar to redraw at once. Each redraw also checks what the apps themselves recorded (see below), which catches what the hooks can't see.
+The agents' own hooks write one small JSON file per session. A small native menu bar app watches that folder and redraws as soon as a file changes. Every 30 seconds, and when you open the panel, it also checks what the apps themselves recorded (see below), which catches what the hooks can't see.
 
 ## Requirements
 
-- macOS, with `/usr/bin/python3` and `swiftc` (both come with the Xcode Command Line Tools: `xcode-select --install`). `swiftc` builds the badge once at install; without it the menu shows a single coloured dot
-- [SwiftBar](https://github.com/swiftbar/SwiftBar): `brew install --cask swiftbar`
+- macOS 13 or later, with `/usr/bin/python3` and `swiftc` (both come with the Xcode Command Line Tools: `xcode-select --install`). `swiftc` builds the menu bar app at install.
 - Claude Code (CLI or Desktop) and/or Codex (CLI 0.169+ or the Codex app)
 
 ## Install
@@ -29,7 +28,7 @@ git clone https://github.com/Handsomemikezzz/agent-monitor.git ~/agent-status
 ~/agent-status/install.sh
 ```
 
-`install.sh` adds hooks to `~/.claude/settings.json` and `~/.codex/hooks.json`. It backs up each file first and leaves your other hooks alone, so you can run it again safely. It also writes the plugin into your SwiftBar plugin folder.
+`install.sh` adds hooks to `~/.claude/settings.json` and `~/.codex/hooks.json`. It backs up each file first and leaves your other hooks alone, so you can run it again safely. It also builds the menu bar app into `build/Agent Status.app` and starts it, now and at every login, through a LaunchAgent (`~/Library/LaunchAgents/io.github.agent-status.plist`). Quitting it from the panel keeps it closed until you log in again.
 
 **Codex:** Codex runs a new hook only after you trust it, and it doesn't prompt you on its own. When `install.sh` runs in a terminal, it lists the hooks and asks you `[y/N]`. You can also do this later:
 
@@ -73,12 +72,14 @@ These deep links aren't documented by either app, so if one stops working, click
 ## Commands
 
 ```sh
-bin/agent-status status      # current sessions as JSON
+bin/agent-status status      # the sessions the panel shows, as JSON
+bin/agent-status dump        # every stored record, as JSON
 bin/agent-status seen-all    # mark every finished session as seen
-bin/agent-status uninstall   # remove the hooks and the plugin
+bin/agent-status uninstall   # remove the hooks and the menu bar app
+/usr/bin/python3 tests/test_states.py   # state transition tests
 ```
 
-Menu language follows your macOS language (English or Chinese). Set `AGENT_STATUS_LANG=zh` or `en` in the plugin file to change it.
+The panel follows your macOS language (English or Chinese).
 
 To debug the hooks, `touch ~/.agent-status/.debug`. Every event is then appended to `~/.agent-status/debug.log`, with prompts and tool output replaced by their length. Delete `.debug` to stop.
 

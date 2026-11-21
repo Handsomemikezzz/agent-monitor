@@ -3,11 +3,11 @@
 
 Subcommands
   hook <claude|codex>   called by the agents' hooks; reads the event JSON on stdin
-  menu                  prints the SwiftBar menu
+  status                sessions to show, as JSON (what the menu bar app reads)
+  dump                  every stored record, as JSON, for debugging
   open <key>            jumps back to a session and marks it seen
   seen-all              marks every finished session as seen
-  status                prints the current sessions as JSON
-  install / uninstall   adds or removes the hooks and the SwiftBar plugin
+  install / uninstall   adds or removes the hooks and the menu bar app
   trust-codex           asks you, then marks the hooks trusted in Codex
 
 Only the Python standard library is used, so it runs on the system /usr/bin/python3.
@@ -25,7 +25,10 @@ import time
 
 STATE_DIR = os.path.expanduser(os.environ.get("AGENT_STATUS_DIR", "~/.agent-status"))
 SELF = os.path.realpath(__file__)
-PLUGIN_NAME = "agent-status"
+ROOT = os.path.dirname(os.path.dirname(SELF))
+APP = os.path.join(ROOT, "build", "Agent Status.app")
+AGENT_LABEL = "io.github.agent-status"
+LAUNCH_AGENT = os.path.expanduser("~/Library/LaunchAgents/%s.plist" % AGENT_LABEL)
 HOOK_MARKER = "agent-status\" hook"  # how our hook commands are recognised on uninstall
 
 READ_TTL = 5 * 3600        # a grey (finished and seen) session is cleared after this
@@ -49,18 +52,6 @@ WAIT_NOTIFICATIONS = {
 # What each session counts as, in badge order: red, green, blue, grey.
 # "read" (finished and seen, or interrupted) is kept on disk but not shown.
 KINDS = ("waiting", "running", "unread")
-COLORS = {"waiting": "#F59F00", "running": "#2F9E44", "unread": "#1971C2", "read": "#ADB5BD"}
-EMOJI = {"waiting": "🟡", "running": "🟢", "unread": "🔵"}
-RENDERER = os.path.join(os.path.dirname(os.path.dirname(SELF)), "build", "agent-status-render")
-
-
-def dot(color):
-    """SwiftBar params for a coloured dot. Plain sfcolor is ignored in the menu bar,
-    so the colour goes through a base64 sfconfig in Palette mode."""
-    cfg = json.dumps({"renderingMode": "Palette", "colors": [COLORS[color]]})
-    return "sfimage=circle.fill sfconfig=" + base64.b64encode(cfg.encode()).decode()
-
-
 # ---------------------------------------------------------------- state files
 
 def _path(key):
@@ -130,28 +121,6 @@ def color_of(rec):
     if st == "done" and not rec.get("seen"):
         return "unread"
     return "read"  # finished and seen, or interrupted
-
-
-def overall(records):
-    """The single colour used when the badge can't be drawn: red > blue > green > grey."""
-    colors = [color_of(r) for r in records]
-    for c in ("waiting", "unread", "running"):
-        if c in colors:
-            return c, colors.count(c)
-    return "read", 0
-
-
-def refresh_menu():
-    """Ask SwiftBar to re-run the plugin now instead of waiting for its timer."""
-    if not any(os.path.isdir(p) for p in ("/Applications/SwiftBar.app",
-                                           os.path.expanduser("~/Applications/SwiftBar.app"))):
-        return
-    try:
-        subprocess.Popen(["/usr/bin/open", "-g", "swiftbar://refreshplugin?name=" + PLUGIN_NAME],
-                         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                         stderr=subprocess.DEVNULL, start_new_session=True)
-    except OSError:
-        pass
 
 
 # ---------------------------------------------------------------- hook
@@ -261,10 +230,8 @@ def cmd_hook(tool):
             if cur and not cur.get("hidden"):
                 cur["hidden"] = True
                 save(key, cur)
-                refresh_menu()
             return
         state, reason = nxt
-        before = color_of(cur) if cur and not cur.get("hidden") else None
         rec = dict(cur or {})
         rec.pop("hidden", None)
         if data.get("transcript_path"):
@@ -298,32 +265,6 @@ def cmd_hook(tool):
         elif state in ("running", "idle"):
             rec["seen"] = True
         save(key, rec)
-    if before != color_of(rec):
-        refresh_menu()
-
-
-# ---------------------------------------------------------------- menu
-
-LANG = "zh" if os.environ.get("AGENT_STATUS_LANG", "").startswith("zh") else "en"
-T = {
-    "en": {"permission": "needs approval", "question": "has a question", "plan": "plan to review",
-           "done": "done", "running": "running", "idle": "idle", "interrupted": "interrupted",
-           "none": "Nothing running or waiting", "seen_all": "Mark all as seen", "folder": "Open state folder",
-           "now": "now", "m": "m ago", "h": "h ago"},
-    "zh": {"permission": "等待审批", "question": "有问题要问你", "plan": "等待确认计划",
-           "done": "已完成", "running": "运行中", "idle": "空闲", "interrupted": "已中断",
-           "none": "没有运行中或待处理的会话", "seen_all": "全部标为已读", "folder": "打开状态目录",
-           "now": "刚刚", "m": " 分钟前", "h": " 小时前"},
-}[LANG]
-
-
-def ago(ts):
-    d = max(0, int(time.time()) - int(ts or 0))
-    if d < 60:
-        return T["now"]
-    if d < 3600:
-        return "%d%s" % (d // 60, T["m"])
-    return "%d%s" % (d // 3600, T["h"])
 
 
 # ---------------------------------------------------------------- what the apps record
@@ -528,7 +469,11 @@ def collect():
                 rec.pop("detail", None)
                 rec["seen"] = state != "done"  # a finish the hooks missed is still news
                 rec.pop("seen_at", None)
-            rec["updated_at"] = max(rec.get("updated_at", 0), ts)
+                # The time it really happened, not when a later hook (say, Desktop
+                # resuming an old session) first told us about the session.
+                rec["updated_at"] = ts
+            else:
+                rec["updated_at"] = max(rec.get("updated_at", 0), ts)
         if rec.get("state") is None:
             rec["state"] = "idle"
             rec["updated_at"] = int(mtime or now)
@@ -559,76 +504,6 @@ def collect():
 
 def _q(s):
     return '"%s"' % str(s).replace('"', "'")
-
-
-def _clean(s):
-    return str(s).replace("|", "/").replace("\n", " ")
-
-
-def render_badge(counts):
-    """Base64 PNG of the four count boxes, cached per combination of counts."""
-    if not os.access(RENDERER, os.X_OK):
-        return None
-    cache = os.path.join(STATE_DIR, "cache")
-    path = os.path.join(cache, "-".join(str(n) for n in counts) + ".b64")
-    try:
-        with open(path) as f:
-            return f.read().strip()
-    except OSError:
-        pass
-    try:
-        out = subprocess.run([RENDERER] + [str(n) for n in counts],
-                             capture_output=True, text=True, timeout=5).stdout.strip()
-    except (OSError, subprocess.SubprocessError):
-        return None
-    if out:
-        os.makedirs(cache, exist_ok=True)
-        with open(path, "w") as f:
-            f.write(out)
-    return out or None
-
-
-def cmd_menu():
-    with Lock():
-        records = [r for r in collect() if color_of(r) in KINDS]
-    color, count = overall(records)
-    colors = [color_of(r) for r in records]
-    badge = render_badge([colors.count(k) for k in KINDS])
-    if badge:
-        print("| image=" + badge)
-    else:  # renderer not built: a single coloured dot with the count
-        print("%s | %s" % (str(count) if count else "", dot(color)))
-    print("---")
-    order = {"waiting": 0, "unread": 1, "running": 2}
-    records.sort(key=lambda r: (order[color_of(r)], -r.get("updated_at", 0)))
-    if not records:
-        print("%s | color=gray" % T["none"])
-    for r in records:
-        c = color_of(r)
-        if r.get("state") == "waiting":
-            status = T.get(r.get("reason"), T["permission"])
-            if r.get("detail"):
-                status += " · " + r["detail"]
-        elif c == "unread":
-            status = T["done"]
-        else:
-            status = T["running"]
-        tool = "Claude" if r.get("tool") == "claude" else "Codex"
-        name = r.get("name") or r.get("title") or ""
-        if len(name) > 28:
-            name = name[:27] + "…"
-        # An emoji dot: SwiftBar draws sfimage dots in the dropdown in plain black.
-        label = "%s %s · %s — %s (%s)" % (EMOJI[c], tool, name, status, ago(r.get("updated_at")))
-        line = "%s | bash=%s param1=open param2=%s terminal=false refresh=true" % (
-            _clean(label), _q(SELF), r["_key"])
-        if r.get("prompt"):
-            line += " tooltip=%s" % _q(_clean(r["prompt"]))
-        print(line)
-        if r.get("prompt"):
-            print("--%s | color=gray size=12" % _clean(r["prompt"]))
-    print("---")
-    print("%s | bash=%s param1=seen-all terminal=false refresh=true" % (T["seen_all"], _q(SELF)))
-    print("%s | bash=/usr/bin/open param1=%s terminal=false" % (T["folder"], _q(STATE_DIR)))
 
 
 # ---------------------------------------------------------------- actions
@@ -672,12 +547,29 @@ def cmd_seen_all():
 
 
 def cmd_status():
+    """The sessions to show and how many of each kind. The menu bar app reads this."""
     with Lock():
-        records = collect()
-    color, count = overall(records)
-    print(json.dumps({"overall": color, "count": count,
-                      "sessions": [{k: v for k, v in r.items() if k != "_key"} for r in records]},
-                     ensure_ascii=False, indent=2))
+        records = [r for r in collect() if color_of(r) in KINDS]
+    records.sort(key=lambda r: -r.get("updated_at", 0))
+    out = {"counts": {k: 0 for k in KINDS}, "sessions": []}
+    for r in records:
+        kind = color_of(r)
+        out["counts"][kind] += 1
+        out["sessions"].append({
+            "key": r["_key"], "tool": r.get("tool") or "", "kind": kind,
+            "reason": r.get("reason") or "", "detail": r.get("detail") or "",
+            "name": r.get("name") or r.get("title") or r.get("tool") or "",
+            "cwd": r.get("cwd") or "", "updated_at": r.get("updated_at") or 0,
+            "prompt": r.get("prompt") or "",
+        })
+    print(json.dumps(out, ensure_ascii=False))
+
+
+def cmd_dump():
+    with Lock():
+        collect()
+        records = all_records()
+    print(json.dumps(records, ensure_ascii=False, indent=2))
 
 
 # ---------------------------------------------------------------- install
@@ -759,73 +651,100 @@ def _uninstall_hooks(path):
     _edit_json(path, fn)
 
 
-def _swiftbar_dir():
+def _swiftbar_plugin():
+    """Where an older version installed its SwiftBar plugin, if anywhere."""
     try:
-        out = subprocess.run(["/usr/bin/defaults", "read", "com.ameba.SwiftBar", "PluginDirectory"],
-                             capture_output=True, text=True).stdout.strip()
+        d = subprocess.run(["/usr/bin/defaults", "read", "com.ameba.SwiftBar", "PluginDirectory"],
+                           capture_output=True, text=True).stdout.strip()
     except OSError:
         return None
-    return os.path.expanduser(out) if out else None
+    path = os.path.join(os.path.expanduser(d), "agent-status.1m.sh") if d else None
+    return path if path and os.path.exists(path) else None
 
 
-def _system_lang():
-    try:
-        out = subprocess.run(["/usr/bin/defaults", "read", "-g", "AppleLanguages"],
-                             capture_output=True, text=True).stdout
-    except OSError:
-        return "en"
-    for line in out.splitlines():
-        line = line.strip(' ",()')
-        if line:
-            return "zh" if line.startswith("zh") else "en"
-    return "en"
+def _launchctl(*args):
+    return subprocess.call(["/bin/launchctl"] + list(args),
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
-def _plugin_path():
-    d = _swiftbar_dir()
-    return os.path.join(d, PLUGIN_NAME + ".1m.sh") if d else None
-
-
-def build_renderer():
-    """Compile the badge renderer. Without it the menu falls back to a coloured dot."""
+def build_app():
+    """Compile the menu bar app into build/Agent Status.app. Returns True on success."""
     import shutil
-    src = os.path.join(os.path.dirname(os.path.dirname(SELF)), "src", "render.swift")
-    print("Badge renderer:")
+    print("Menu bar app:")
     if not shutil.which("swiftc"):
-        print("  swiftc not found (xcode-select --install); using a plain coloured dot.")
-        return
-    os.makedirs(os.path.dirname(RENDERER), exist_ok=True)
-    if subprocess.call(["swiftc", "-O", src, "-o", RENDERER]) == 0:
-        shutil.rmtree(os.path.join(STATE_DIR, "cache"), ignore_errors=True)
-        print("  built:  " + RENDERER)
-    else:
-        print("  build failed; using a plain coloured dot.")
+        print("  swiftc not found. Install the Xcode Command Line Tools (xcode-select --install)\n"
+              "  and run install again.")
+        return False
+    macos = os.path.join(APP, "Contents", "MacOS")
+    os.makedirs(macos, exist_ok=True)
+    src = sorted(glob.glob(os.path.join(ROOT, "app", "*.swift")))
+    if subprocess.call(["swiftc", "-O", "-target", "%s-apple-macos13" % os.uname().machine,
+                        "-o", os.path.join(macos, "AgentStatus")] + src) != 0:
+        print("  build failed.")
+        return False
+    with open(os.path.join(ROOT, "app", "Info.plist")) as f:
+        plist = f.read()
+    with open(os.path.join(APP, "Contents", "Info.plist"), "w") as f:
+        f.write(plist)
+    # Ad-hoc signature, so macOS treats the bundle as one app.
+    subprocess.call(["/usr/bin/codesign", "--force", "--sign", "-", APP],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    print("  built:  " + APP)
+    return True
+
+
+def start_app():
+    """Run the app now and at every login, through a LaunchAgent."""
+    exe = os.path.join(APP, "Contents", "MacOS", "AgentStatus")
+    os.makedirs(os.path.dirname(LAUNCH_AGENT), exist_ok=True)
+    with open(LAUNCH_AGENT, "w") as f:
+        f.write("""<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>%s</string>
+  <key>ProgramArguments</key><array><string>%s</string></array>
+  <key>EnvironmentVariables</key><dict>
+    <key>AGENT_STATUS_BIN</key><string>%s</string>
+    <key>AGENT_STATUS_DIR</key><string>%s</string>
+  </dict>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>
+  <key>ProcessType</key><string>Interactive</string>
+</dict>
+</plist>
+""" % (AGENT_LABEL, _xml(exe), _xml(SELF), _xml(STATE_DIR)))
+    domain = "gui/%d" % os.getuid()
+    _launchctl("bootout", "%s/%s" % (domain, AGENT_LABEL))
+    ok = _launchctl("bootstrap", domain, LAUNCH_AGENT) == 0
+    print("  %s: %s" % ("started" if ok else "could not start (log out and in, or open the app)",
+                        LAUNCH_AGENT))
+
+
+def stop_app():
+    _launchctl("bootout", "gui/%d/%s" % (os.getuid(), AGENT_LABEL))
+    if os.path.exists(LAUNCH_AGENT):
+        os.remove(LAUNCH_AGENT)
+        print("  removed " + LAUNCH_AGENT)
+
+
+def _xml(s):
+    return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
 def cmd_install():
     os.makedirs(STATE_DIR, exist_ok=True)
     os.chmod(SELF, 0o755)
-    build_renderer()
     print("Claude Code:")
     _install_hooks(os.path.expanduser("~/.claude/settings.json"), "claude", CLAUDE_EVENTS)
     print("Codex:")
     _install_hooks(os.path.expanduser("~/.codex/hooks.json"), "codex", CODEX_EVENTS)
-    plugin = _plugin_path()
-    print("SwiftBar:")
-    if plugin:
-        with open(plugin, "w") as f:
-            f.write("#!/bin/sh\n# <swiftbar.hideRunInTerminal>true</swiftbar.hideRunInTerminal>\n"
-                    "# <swiftbar.hideLastUpdated>true</swiftbar.hideLastUpdated>\n"
-                    "# <swiftbar.hideDisablePlugin>true</swiftbar.hideDisablePlugin>\n"
-                    "# <swiftbar.hideSwiftBar>true</swiftbar.hideSwiftBar>\n"
-                    "# <swiftbar.hideAbout>true</swiftbar.hideAbout>\n"
-                    "export AGENT_STATUS_LANG=%s\nexec \"%s\" menu\n" % (_system_lang(), SELF))
-        os.chmod(plugin, 0o755)
-        print("  wrote:  " + plugin)
-        refresh_menu()
-    else:
-        print("  SwiftBar plugin folder not found. Install SwiftBar (brew install --cask swiftbar),\n"
-              "  choose a plugin folder, then run install again.")
+    if build_app():
+        start_app()
+    old = _swiftbar_plugin()
+    if old:
+        os.remove(old)
+        print("  removed the old SwiftBar plugin: " + old)
     print("\nCodex trust:")
     if sys.stdin.isatty() and _codex_exe():
         cmd_trust_codex()
@@ -948,10 +867,12 @@ def cmd_uninstall():
     _uninstall_hooks(os.path.expanduser("~/.claude/settings.json"))
     print("Codex:")
     _uninstall_hooks(os.path.expanduser("~/.codex/hooks.json"))
-    plugin = _plugin_path()
-    if plugin and os.path.exists(plugin):
-        os.remove(plugin)
-        print("SwiftBar:\n  removed " + plugin)
+    print("Menu bar app:")
+    stop_app()
+    old = _swiftbar_plugin()
+    if old:
+        os.remove(old)
+        print("  removed the old SwiftBar plugin: " + old)
     print("\nState folder left in place: %s (delete it if you like)." % STATE_DIR)
 
 
@@ -965,14 +886,14 @@ def main(argv):
         except Exception:
             pass  # a hook must never break the agent
         return 0
-    if cmd == "menu":
-        cmd_menu()
-    elif cmd == "open" and len(argv) > 2:
+    if cmd == "open" and len(argv) > 2:
         cmd_open(argv[2])
     elif cmd == "seen-all":
         cmd_seen_all()
     elif cmd == "status":
         cmd_status()
+    elif cmd == "dump":
+        cmd_dump()
     elif cmd == "install":
         cmd_install()
     elif cmd == "uninstall":

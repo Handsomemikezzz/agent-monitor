@@ -10,12 +10,12 @@
 
 已完成且看过的、被中断的会话不显示（记录保留 5 小时后清理）。
 
-菜单栏是一个圆角胶囊，分成黄、绿、蓝三段，每段是对应的会话数，例如 `[2|1|3]`。徽标由 `src/render.swift` 画成 2x PNG（144 dpi），安装时编译一次，同一组数字只渲染一次并缓存在 `~/.agent-status/cache/`。没有 `swiftc` 时退回成单个彩色圆点加数字（优先级：黄 > 蓝 > 绿）。
+菜单栏是一个圆角胶囊，分成黄、绿、蓝三段，每段是对应的会话数，例如 `[2|1|3]`。点开是一个面板，详见第 4 节。
 
 ## 设计原则
 
 - **没有常驻监控进程。** hook 触发时写一次文件，并通知菜单栏立即刷新。每次刷新时再读一下应用自己的记录来校正（见第 2 节末尾），只读最近活跃的会话。
-- **采集和显示分开。** 两边通过一个状态目录交换数据。显示层可以从 SwiftBar 换成原生 App，hook 部分不用改。
+- **采集和显示分开。** 两边通过一个状态目录交换数据。显示层从 SwiftBar 插件换成原生 App 时，hook 部分一行没改。
 - **hook 必须快，且不能影响会话。** 毫秒级完成，固定 `exit 0`，不往 stdout 输出任何内容（`PreToolUse` 之类的事件会把 stdout 当成返回给它的指令）。
 
 ## 架构
@@ -26,7 +26,7 @@ Claude Code hooks ─┐                                   ~/.agent-status/
 Codex hooks ───────┘   (从 stdin 读事件 JSON，           codex-<session_id>.json
                         从环境变量读跳转信息)                    │
                                                                ▼
-                                     菜单栏（SwiftBar 插件）读目录 → 汇总颜色 → 下拉列表
+                                     菜单栏 App 监听目录 → agent-status status → 徽标 + 面板
                                                                │ 点击
                                                                ▼
                                      bin/agent-status open <key>  → open 深链接 / 激活终端
@@ -107,18 +107,20 @@ Codex hooks ───────┘   (从 stdin 读事件 JSON，           co
 | Codex App | `CODEX_INTERNAL_ORIGINATOR_OVERRIDE` 以 `desktop` 结尾（不分大小写，实测值 `Codex Desktop`），或数据库里 `originator = Codex Desktop` | `url`：`codex://threads/<session_id>` |
 | 终端里的 CLI（两者都一样） | 以上都不满足 | `app`：根据 `TERM_PROGRAM` 激活对应终端（iTerm、Terminal、Ghostty、VS Code 等）。v2 再按 tty 精确定位到具体 tab |
 
-## 4. 显示层（v1：SwiftBar 插件）
+## 4. 显示层：原生菜单栏 App
 
-- `plugins/agent-status.1m.sh`：读目录，输出图标和下拉列表。文件名里的 `1m` 只是兜底刷新周期，平时由 hook 写完后调 `open -g "swiftbar://refreshplugin?name=agent-status"` 立即刷新。
-- 下拉每行显示：`● Claude · 会话标题 — 等待审批（3 分钟前）`。点击执行 `agent-status open`。
-- `agent-status open`：执行 `jump`，同时把该会话标成 `seen=true`，蓝色就从徽标上消失。黄色不受影响，要等真正处理完才清除。
-- 底部提供"全部标为已读"和"清理过期会话"两个菜单项。
+`app/main.swift`，单文件 SwiftUI + AppKit，`install` 时用 `swiftc` 编译成 `build/Agent Status.app`（`LSUIElement`，没有 Dock 图标），用 LaunchAgent `io.github.agent-status` 登录时启动。第一版用的是 SwiftBar 插件，但 SwiftBar 的下拉菜单是系统 NSMenu，只能一行行文字，做不出卡片、分段控件这类面板，所以换成了自己的 App。
 
-**蓝色消失的情况：** 在该会话里发下一条消息（`UserPromptSubmit`）；从菜单点进去；在 App 里点开它。已读的记录 5 小时后清理；黄色和蓝色没人看的话 24 小时后清理。
+- **只负责画。** 状态逻辑全在 `bin/agent-status`，App 运行 `agent-status status` 拿 JSON（各类数量 + 要显示的会话），点击时运行 `agent-status open <key>` / `seen-all`。
+- **什么时候刷新：** 用 `DispatchSource` 监听状态目录，hook 写完文件就立即刷新；打开面板时刷新；每 30 秒刷新一次（让第 2 节的校正能跟上 Esc、拒绝审批这类不发 hook 的变化）。正在跑时又来的刷新请求合并成一次。
+- **徽标：** 菜单栏里一个圆角胶囊，黄 / 绿 / 蓝三段，每段一个数字，按屏幕倍率直接用 AppKit 画。
+- **面板（参照 KeyStats 的样式）：** 标题和 Claude / Codex 会话数；三张统计卡片（等你处理、运行中、已完成未读）；全部 / Claude / Codex 分段筛选；按"等你处理 → 已完成未读 → 运行中"分组的会话卡片，每张显示应用图标、标题、状态、多久以前、最后一条提示词，悬停高亮，点击跳回；底部是"全部标为已读"、"打开状态目录"和"退出"。会话超过 5 个时列表可滚动。
+- 面板语言跟随系统（中文或英文）。
+- `AGENT_STATUS_OPEN_PANEL=1` 启动时会自动打开面板并打印窗口号，方便用 `screencapture -l` 截图。
 
-下拉菜单每行前面用 emoji 圆点（🟡🟢🔵）。SwiftBar 在下拉菜单里会把 `sfimage` 圆点画成纯黑色。插件头部设置了 `hideSwiftBar`、`hideAbout` 等，去掉 SwiftBar 自带的菜单项。
+`agent-status open`：执行 `jump`，同时把该会话标成 `seen=true`，蓝色就从徽标上消失。黄色不受影响，要等真正处理完才清除。
 
-以后想去掉 SwiftBar 依赖，可以写一个原生 Swift 小程序（`NSStatusItem` + `DispatchSource` 监听目录），继续读同一个状态目录。
+**蓝色消失的情况：** 在该会话里发下一条消息（`UserPromptSubmit`）；从面板点进去；在 App 里点开它。已读的记录 5 小时后清理；黄色和蓝色没人看的话 24 小时后清理。
 
 ## 5. 仓库结构
 
@@ -127,14 +129,17 @@ agent-status/
 ├── DESIGN.md
 ├── README.md                 # 安装与使用（英文，面向开源）
 ├── bin/
-│   └── agent-status          # 单文件：hook / menu / open / install 子命令
-├── plugins/
-│   └── agent-status.1m.sh    # SwiftBar 插件
-├── install.sh                # 合并写入 ~/.claude/settings.json 和 ~/.codex/hooks.json（先备份，保证重复运行结果不变）
+│   └── agent-status          # 单文件 Python：hook / status / open / install 等子命令
+├── app/
+│   ├── main.swift            # 菜单栏 App
+│   └── Info.plist
+├── tests/
+│   └── test_states.py        # 状态切换测试（假事件 + 假对话记录）
+├── install.sh                # 写入 hooks、编译并启动 App（先备份，可重复运行）
 └── uninstall.sh
 ```
 
-核心是一个只用标准库的 Python 脚本 `bin/agent-status`，用系统自带的 `/usr/bin/python3` 运行。hook、菜单、跳转、安装都是它的子命令，不依赖 `jq`。
+核心是一个只用标准库的 Python 脚本 `bin/agent-status`，用系统自带的 `/usr/bin/python3` 运行。hook、状态计算、跳转、安装都是它的子命令，不依赖 `jq`。
 
 ## 6. 实测结果（2026-11-19）
 
@@ -142,14 +147,15 @@ agent-status/
 2. ✅ Codex hook 收到的 `session_id`（UUIDv7）就是 threadId。`codex://threads/<id>` 能让 Codex App 切到对应会话。
 3. ✅ Codex 不会为新 hook 主动弹出信任提示。`hooks/list` 能看到所有 hook，状态是 `untrusted`。`agent-status trust-codex` 用的接口和 Codex App 的 Settings → Hooks 页面一样（`codex app-server` 的 `config/batchWrite` 写入 `hooks.state."<key>".trusted_hash`），必须在终端里由用户输入 `y` 确认。信任后，`codex exec` 依次触发 `SessionStart → UserPromptSubmit → Stop → SessionEnd`；交互界面里遇到审批会触发 `PermissionRequest`（tool_name 是 `Bash`），按 Ctrl-C 拒绝审批会触发 `Interrupt`。
 4. ✅ 两种 Claude 链接都能在两个会话之间来回跳转（用 `get_window_layout` 确认过当前显示的是哪个会话）。
-5. ✅ SwiftBar 2.1.1 在菜单栏里不认单独的 `sfcolor`，要用 base64 编码的 `sfconfig`（`renderingMode: Palette`）才能显示颜色。
+5. ✅（已不再使用 SwiftBar）SwiftBar 2.1.1 在菜单栏里不认单独的 `sfcolor`，要用 base64 编码的 `sfconfig`；下拉菜单里的 `sfimage` 圆点只能是黑色。
 6. ✅ 深链接会把 App 切到对应会话，但如果你正在用别的 App，它的窗口不会到最前面，`open -b` 也拉不上来。所以点击后再用 AppleScript 的 `tell application id … to activate` 激活一次，这样可以。
 7. ✅ 子进程会继承 `CLAUDE_CODE_HOST_SESSION_ID`（比如在 Desktop 会话里启动的 codex 或 claude）。所以只有 `CLAUDE_CODE_ENTRYPOINT=claude-desktop` 时才生成 Desktop 会话的跳转链接。
 8. ✅ Codex App 里真实会话的 hook 环境变量是 `CODEX_INTERNAL_ORIGINATOR_OVERRIDE=Codex Desktop`（和从 App 代码里推断的 `codex_work_desktop` 不一样），判断时不区分大小写。App 退出时会给会话发 `SessionEnd(other)`；Claude Desktop 重启时也一样，重新打开会话时再发 `SessionStart(resume)`。
 
 ## 7. 已知限制
 
-- Claude 里按 Esc 中断、拒绝审批都不发 hook，要等下次菜单刷新读到对话记录才从徽标上消失。hook 触发了别的会话会立即刷新，否则最多等 1 分钟（SwiftBar 的兜底刷新周期）。
-- 如果你一直看着某个 Desktop 会话、但 Desktop 不在最前面时它完成了，会记成未读，直到你切走再切回来、点菜单或发下一条消息。
+- Claude 里按 Esc 中断、拒绝审批都不发 hook，要等下次刷新读到对话记录才从徽标上消失，最多 30 秒（打开面板时会立即刷新）。
+- 如果你一直看着某个 Desktop 会话、但 Desktop 不在最前面时它完成了，会记成未读，直到你切走再切回来、在面板里点它或发下一条消息。
 - Desktop 会话文件、对话记录格式、Codex 数据库表结构都是应用内部的东西，升级后可能变化。读不到时只是少了校正，hook 那部分照常工作。
+- App 是本机编译、ad-hoc 签名的，不经过公证，所以只能用 `install.sh` 在本机构建，不能直接分发 .app。
 - 深链接属于两个应用的内部接口，没有公开文档，升级后可能失效。所以 `agent-status open` 在链接打不开时，至少要把对应应用切到前台。

@@ -1,0 +1,58 @@
+#!/usr/bin/python3
+"""State transition tests: feeds hook events and fake transcripts to bin/agent-status
+in a throwaway state folder and checks what it decides.
+
+    /usr/bin/python3 tests/test_states.py
+"""
+import json, os, shutil, subprocess, sys, tempfile, time
+BIN = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "bin", "agent-status")
+D = tempfile.mkdtemp(prefix="agent-status-test-")
+base = dict(os.environ, AGENT_STATUS_DIR=D, CLAUDE_CODE_ENTRYPOINT="cli")
+base.pop("CLAUDE_CODE_HOST_SESSION_ID", None)
+os.makedirs(D, exist_ok=True)
+def iso(): return time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime())
+class S:
+    def __init__(s, sid, env):
+        s.sid, s.env = sid, env; s.tr = os.path.join(D, sid + ".jsonl"); open(s.tr, "w").close()
+    def line(s, d): open(s.tr, "a").write(json.dumps(dict(d, timestamp=iso())) + "\n")
+    def hook(s, ev, **kw):
+        subprocess.run([BIN, "hook", "claude"], input=json.dumps(dict(hook_event_name=ev, session_id=s.sid, cwd="/tmp/p", transcript_path=s.tr, **kw)), text=True, env=s.env)
+    def state(s):
+        for r in json.loads(subprocess.run([BIN, "dump"], capture_output=True, text=True, env=base).stdout):
+            if r["session_id"] == s.sid and not r.get("hidden"):
+                return "%s/%s/%s" % (r["state"], r.get("reason") or "-", "seen" if r.get("seen") else "unseen")
+        return "hidden"
+    def check(s, label, want):
+        got = s.state(); print("ok  " if got == want else "FAIL", label, got, "" if got == want else "(want %s)" % want)
+        if got != want:
+            FAILED.append(label)
+FAILED = []
+END = {"type": "assistant", "message": {"stop_reason": "end_turn", "content": []}}
+a = S("cli-1", base)
+a.hook("UserPromptSubmit", prompt="hi"); a.line({"type": "user", "message": {"content": "hi"}})
+a.check("prompt sent", "running/-/seen")
+a.line({"type": "assistant", "message": {"stop_reason": "tool_use", "content": []}}); time.sleep(.2)
+a.hook("PermissionRequest", tool_name="Bash"); a.check("approval asked", "waiting/permission/seen")
+time.sleep(3); a.line({"type": "user", "message": {"content": [{"type": "tool_result", "content": "[Request interrupted by user for tool use]"}]}})
+a.check("denied, no hook", "idle/interrupted/seen")
+a.hook("UserPromptSubmit", prompt="2"); time.sleep(3); a.line(END)
+a.check("finished, Stop missed", "done/-/unseen")
+subprocess.run([BIN, "open", "claude-cli-1"], env=dict(base, PATH="/nonexistent"), capture_output=True)
+a.check("clicked in menu", "done/-/seen")
+a.hook("UserPromptSubmit", prompt="3"); time.sleep(3); a.line({"type": "user", "message": {"content": "[Request interrupted by user]"}})
+a.check("Esc, no hook", "idle/interrupted/seen")
+a.hook("UserPromptSubmit", prompt="4"); a.hook("Stop"); a.check("Stop hook", "done/-/unseen")
+a.hook("SessionEnd", reason="other"); a.check("CLI session closed", "hidden")
+# A Desktop session: the app ends sessions when it quits and resumes them later.
+d = S("desk-1", dict(base, CLAUDE_CODE_ENTRYPOINT="claude-desktop", CLAUDE_CODE_HOST_SESSION_ID="local_test-desk-1"))
+d.hook("UserPromptSubmit", prompt="x"); d.line(END); d.hook("Stop")
+d.check("desktop turn done", "done/-/unseen")
+d.hook("SessionEnd", reason="other"); d.check("app quit keeps it", "done/-/unseen")
+d.hook("SessionStart", source="resume"); d.check("app resumes it", "done/-/unseen")
+# A session we never saw before, resumed after its turn already finished.
+n = S("new-1", base); n.line(END); time.sleep(1)
+n.hook("SessionStart", source="resume"); n.check("unknown session resumed", "done/-/unseen")
+
+shutil.rmtree(D, ignore_errors=True)
+print("%d failed" % len(FAILED) if FAILED else "all passed")
+sys.exit(1 if FAILED else 0)
