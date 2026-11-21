@@ -9,7 +9,7 @@ A macOS menu bar indicator for Claude Code, Codex and Antigravity sessions.
 ![Codex](https://img.shields.io/badge/Codex-CLI%20%26%20app-412991)
 ![Antigravity](https://img.shields.io/badge/Antigravity-experimental-4285F4)
 
-<img src="docs/images/menu-bar.png" width="340" alt="The menu bar badge in a light and a dark menu bar: a yellow dot with 1, a green dot with 2, a blue dot with 2">
+<img src="docs/images/menu-bar.png" width="340" alt="The menu bar badge in a light and a dark menu bar: one pill of a yellow block with 1, a green block with 2 and a blue block with 2">
 
 </div>
 

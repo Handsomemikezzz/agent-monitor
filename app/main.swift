@@ -1,6 +1,6 @@
 // Agent Status: the menu bar app.
 //
-// Shows a three-colour badge in the menu bar (waiting for you · running · finished,
+// Shows a three-colour block badge in the menu bar (waiting for you · running · finished,
 // unread) and, on click, a panel listing those sessions. Click a session to jump
 // back to it.
 //
@@ -71,6 +71,20 @@ enum Kind: String, CaseIterable {
         case .running: return .systemGreen
         case .unread: return .systemBlue
         }
+    }
+
+    /// Solid fill for the menu bar block: saturated enough to read at a glance in any menu bar.
+    var blockNSColor: NSColor {
+        switch self {
+        case .waiting: return NSColor(srgbRed: 1.00, green: 0.78, blue: 0.00, alpha: 1)
+        case .running: return NSColor(srgbRed: 0.16, green: 0.70, blue: 0.29, alpha: 1)
+        case .unread: return NSColor(srgbRed: 0.04, green: 0.48, blue: 1.00, alpha: 1)
+        }
+    }
+
+    /// Count colour on a filled block: dark on yellow, white on green and blue.
+    var blockTextNSColor: NSColor {
+        self == .waiting ? NSColor(white: 0.10, alpha: 1) : .white
     }
 
     var dotColor: Color { Color(nsColor: dotNSColor) }
@@ -209,37 +223,37 @@ final class Store: ObservableObject {
 
 // MARK: - Badge
 
-/// Three always-visible status lights (waiting · running · unread) with tabular counts.
+/// One continuous pill of solid colour blocks (waiting · running · unread), each with its count.
+/// Blocks with no sessions are faded so the ones that matter stand out.
 func badgeImage(_ snap: Snapshot) -> NSImage {
-    let dotSize: CGFloat = 6.5
-    let dotTextGap: CGFloat = 3.5
-    let itemGap: CGFloat = 7.5
-    let sidePad: CGFloat = 3
-    let height: CGFloat = 18
+    let height: CGFloat = 18, pillH: CGFloat = 16, radius: CGFloat = 4.5
+    let minSeg: CGFloat = 20, segPad: CGFloat = 6
 
-    let items = Kind.badgeOrder.map { kind -> (Kind, Int, String, NSFont, NSSize) in
+    let items = Kind.badgeOrder.map { kind -> (Kind, Int, String, NSFont, NSSize, CGFloat) in
         let count = snap.count(kind)
         let text = count > 99 ? "99+" : String(count)
-        let font = NSFont.monospacedDigitSystemFont(ofSize: 12, weight: count > 0 ? .semibold : .regular)
+        let font = NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .bold)
         let size = (text as NSString).size(withAttributes: [.font: font])
-        return (kind, count, text, font, size)
+        return (kind, count, text, font, size, max(minSeg, ceil(size.width) + segPad * 2))
     }
-    let contentWidth = items.reduce(CGFloat(0)) { $0 + dotSize + dotTextGap + $1.4.width }
-        + CGFloat(max(0, items.count - 1)) * itemGap
-    let totalWidth = sidePad * 2 + contentWidth
+    let width = items.reduce(CGFloat(0)) { $0 + $1.5 }
 
-    let image = NSImage(size: NSSize(width: ceil(totalWidth), height: height), flipped: false) { _ in
-        var x = sidePad
-        for (kind, count, text, font, size) in items {
-            let dotColor = count > 0 ? kind.dotNSColor : kind.dotNSColor.withAlphaComponent(0.60)
-            dotColor.setFill()
-            NSBezierPath(ovalIn: NSRect(x: x, y: (height - dotSize) / 2, width: dotSize, height: dotSize)).fill()
-            x += dotSize + dotTextGap
+    let image = NSImage(size: NSSize(width: width, height: height), flipped: false) { _ in
+        let pill = NSRect(x: 0, y: (height - pillH) / 2, width: width, height: pillH)
+        let shape = NSBezierPath(roundedRect: pill, xRadius: radius, yRadius: radius)
+        var x: CGFloat = 0
+        for (kind, count, text, font, size, segW) in items {
+            let slice = NSRect(x: x, y: 0, width: segW, height: height)
+            NSGraphicsContext.saveGraphicsState()
+            NSBezierPath(rect: slice).addClip()
+            (count > 0 ? kind.blockNSColor : kind.blockNSColor.withAlphaComponent(0.28)).setFill()
+            shape.fill()
+            NSGraphicsContext.restoreGraphicsState()
 
-            let textColor = count > 0 ? NSColor.labelColor : NSColor.labelColor.withAlphaComponent(0.45)
-            (text as NSString).draw(at: NSPoint(x: x, y: (height - size.height) / 2),
+            let textColor = count > 0 ? kind.blockTextNSColor : NSColor.labelColor.withAlphaComponent(0.5)
+            (text as NSString).draw(at: NSPoint(x: slice.midX - size.width / 2, y: pill.midY - size.height / 2),
                                     withAttributes: [.font: font, .foregroundColor: textColor])
-            x += size.width + itemGap
+            x += segW
         }
         return true
     }
