@@ -4,15 +4,17 @@
 
 | 颜色 | 含义 |
 |---|---|
-| 🟥 红 | 在等你的会话：权限审批、提问（AskUserQuestion）、计划确认 |
-| 🟩 绿 | 已完成、你还没看的会话 |
-| ⬜ 灰 | 其他会话（运行中或空闲） |
+| 🟨 黄 | 在等你的会话：权限审批、提问（AskUserQuestion）、计划确认 |
+| 🟩 绿 | 运行中 |
+| 🟦 蓝 | 已完成、你还没看 |
 
-菜单栏并排显示三个圆角框，每个框里是对应的会话数，例如 `[2][1][0]`。徽标由 `src/render.swift` 画成 2x PNG（144 dpi），安装时编译一次，同一组数字只渲染一次并缓存在 `~/.agent-status/cache/`。没有 `swiftc` 时退回成单个彩色圆点加数字（优先级：红 > 绿 > 灰）。
+已完成且看过的、被中断的会话不显示（记录保留 5 小时后清理）。
+
+菜单栏是一个圆角胶囊，分成黄、绿、蓝三段，每段是对应的会话数，例如 `[2|1|3]`。徽标由 `src/render.swift` 画成 2x PNG（144 dpi），安装时编译一次，同一组数字只渲染一次并缓存在 `~/.agent-status/cache/`。没有 `swiftc` 时退回成单个彩色圆点加数字（优先级：黄 > 蓝 > 绿）。
 
 ## 设计原则
 
-- **没有常驻监控进程，不轮询。** 只在 hook 触发时写一次文件，并通知菜单栏刷新。
+- **没有常驻监控进程。** hook 触发时写一次文件，并通知菜单栏立即刷新。每次刷新时再读一下应用自己的记录来校正（见第 2 节末尾），只读最近活跃的会话。
 - **采集和显示分开。** 两边通过一个状态目录交换数据。显示层可以从 SwiftBar 换成原生 App，hook 部分不用改。
 - **hook 必须快，且不能影响会话。** 毫秒级完成，固定 `exit 0`，不往 stdout 输出任何内容（`PreToolUse` 之类的事件会把 stdout 当成返回给它的指令）。
 
@@ -41,23 +43,41 @@ Codex hooks ───────┘   (从 stdin 读事件 JSON，           co
 | Claude 跳转链接 | `claude://claude.ai/epitaxy/local_<uuid>`（App 自己对外给的就是这种链接）。另一种 `claude://code/continue?session=local_<uuid>` 也能用，但受 App 的"入口"设置控制。两种都要 `local_` 格式的 ID，不能用 CLI 的 UUID | Claude.app URL 处理代码；已实测在两个会话之间跳转 |
 | Codex App | `/Applications/ChatGPT.app`，bundle id 是 `com.openai.codex`，注册了 `codex://` | Info.plist |
 | Codex 跳转链接 | `codex://threads/<threadId>` | ChatGPT.app 代码 |
-| Codex App 会话标识 | App 启动 codex 时设了 `CODEX_INTERNAL_ORIGINATOR_OVERRIDE=codex_work_desktop` | ChatGPT.app 代码 |
+| Codex App 会话标识 | App 里会话的 hook 环境变量 `CODEX_INTERNAL_ORIGINATOR_OVERRIDE=Codex Desktop`；hook 的 `transcript_path` 是 null | 实测（debug.log） |
 | Codex hooks | `hooks` 已是 stable。CLI 0.169 支持 `SessionStart`、`UserPromptSubmit`、`PreToolUse`、`PermissionRequest`、`PostToolUse`、`Stop`、`Interrupt`、`SessionEnd`、`SubagentStop` | `codex features list`、二进制字符串 |
 | Codex `notify` | 已被 Computer Use 占用，只能挂一个程序，**不使用** | `~/.codex/config.toml` |
 
 ## 2. 事件 → 状态
 
-每个会话一个状态，取值 `running`、`waiting`、`done`。`running` 在菜单栏里算灰色。
+每个会话一个状态：`running`、`waiting`、`done`、`idle`。`done` 再按 `seen` 分成未读（蓝色）和已读（不显示）；`idle`（中断、长时间没动静）也不显示。
 
 | 状态 | Claude Code | Codex |
 |---|---|---|
-| running | `SessionStart`、`UserPromptSubmit`、`PostToolUse`（审批通过，清除红色） | `SessionStart`、`UserPromptSubmit`、`PostToolUse` |
+| running | `UserPromptSubmit`；`PostToolUse`（审批通过，清除黄色） | `UserPromptSubmit`、`PostToolUse` |
 | **waiting** | `PermissionRequest`；`PreToolUse` 匹配 `AskUserQuestion\|ExitPlanMode`；`Notification`（`permission_prompt`）作兜底 | `PermissionRequest` |
-| **done** | `Stop` | `Stop`、`Interrupt` |
-| 删除文件 | `SessionEnd` | `SessionEnd` |
+| **done** | `Stop` | `Stop` |
+| idle | 对话记录里出现 `[Request interrupted by user`（Esc、拒绝审批） | `Interrupt` |
+| 隐藏 | 终端会话：`SessionEnd`；Desktop 会话：归档 | 终端会话：`SessionEnd`；App 会话：归档 |
 
-- 不监听 `SubagentStop`，否则子任务结束时会提前变绿。
+- `SessionStart` 不改变状态。Desktop 恢复旧会话、上下文压缩时都会触发它，并不代表开始了新一轮。
+- 不监听 `SubagentStop`，否则子任务结束时会提前变色。
 - Claude 的 `Notification` 里 `idle_prompt` 不处理（它表示空闲超过 60 秒，不是新事件）。
+- `SessionEnd` 后记录保留但隐藏，免得下面的扫描又把它找回来。
+- Claude Desktop 和 Codex App 每次退出都会给所有会话发 `SessionEnd`，重新打开某个会话时发 `SessionStart(resume)`。所以对 App 会话（`jump` 是深链接的）忽略 `SessionEnd`，以归档为准。没见过的会话收到 `SessionStart` 时，状态从对话记录里读，不默认成空闲。
+
+### 用应用自己的记录校正
+
+只靠 hook 会漏掉三类情况：Esc 中断、拒绝审批（都不发 hook）、安装前就开着且之后没触发过 hook 的会话。所以菜单每次刷新时，对最近活跃的会话再读三样东西：
+
+| 来源 | 读什么 | 用来做什么 |
+|---|---|---|
+| 对话记录末尾（Claude：`~/.claude/projects/*/<id>.jsonl`；Codex：`rollout-*.jsonl`，路径来自 hook 的 `transcript_path` 或 Codex 数据库） | 最后一轮的结果：结束（`stop_reason: end_turn`、`stop_hook_summary` / `task_complete`）、中断（`[Request interrupted by user` / `turn_aborted`）、还在跑 | 对话记录比最近一次 hook 新（多于 2 秒）时，以对话记录为准。审批和提问只认 hook |
+| Claude Desktop 的会话文件 `~/Library/Application Support/Claude/claude-code-sessions/*/*/local_*.json` | `cliSessionId`、`title`、`isArchived`、`lastFocusedAt` | 发现会话、显示真实标题、隐藏归档；完成后又点开过（`lastFocusedAt` ≥ 完成时间）算已读 |
+| Codex 数据库 `~/.codex/state_*.sqlite`（只读） | `threads` 的标题、`archived`、`originator`；`thread_read_receipts.first_unread_turn` | 发现会话、显示标题、隐藏归档；`originator = Codex Desktop` 时生成 `codex://threads/<id>`；未读标记直接用 App 自己的 |
+
+另外，Stop 触发时如果 Claude Desktop 在最前面，而且这个会话是最近一次点开的那个（也就是你正看着它完成），直接记为已读。
+
+运行中的会话如果 30 分钟没有任何动静（没有 hook，对话记录也没更新），改成 idle，防止进程没了还一直显示绿色。
 
 ## 3. 状态文件
 
@@ -71,6 +91,8 @@ Codex hooks ───────┘   (从 stdin 读事件 JSON，           co
   "reason": "permission",
   "cwd": "/Users/me/proj",
   "title": "proj",
+  "name": "Desktop 或 Codex 里的会话标题",
+  "transcript": "/Users/me/.claude/projects/-Users-me-proj/3f2a….jsonl",
   "updated_at": 1763515200,
   "seen": false,
   "jump": { "kind": "url", "target": "claude://code/continue?session=local_8c1d…" }
@@ -82,17 +104,19 @@ Codex hooks ───────┘   (从 stdin 读事件 JSON，           co
 | 来源 | 判定 | `jump` |
 |---|---|---|
 | Claude Desktop | `CLAUDE_CODE_HOST_SESSION_ID` 存在 | `url`：`claude://claude.ai/epitaxy/$CLAUDE_CODE_HOST_SESSION_ID` |
-| Codex App | `CODEX_INTERNAL_ORIGINATOR_OVERRIDE=codex_work_desktop` | `url`：`codex://threads/<session_id>` |
+| Codex App | `CODEX_INTERNAL_ORIGINATOR_OVERRIDE` 以 `desktop` 结尾（不分大小写，实测值 `Codex Desktop`），或数据库里 `originator = Codex Desktop` | `url`：`codex://threads/<session_id>` |
 | 终端里的 CLI（两者都一样） | 以上都不满足 | `app`：根据 `TERM_PROGRAM` 激活对应终端（iTerm、Terminal、Ghostty、VS Code 等）。v2 再按 tty 精确定位到具体 tab |
 
 ## 4. 显示层（v1：SwiftBar 插件）
 
 - `plugins/agent-status.1m.sh`：读目录，输出图标和下拉列表。文件名里的 `1m` 只是兜底刷新周期，平时由 hook 写完后调 `open -g "swiftbar://refreshplugin?name=agent-status"` 立即刷新。
-- 下拉每行显示：`🟡 Claude · proj — 等待审批（3 分钟前）`。点击执行 `agent-status open`。
-- `agent-status open`：执行 `jump`，同时把该会话标成 `seen=true`，绿色就会消失。红色不受影响，要等真正处理完才清除。
+- 下拉每行显示：`● Claude · 会话标题 — 等待审批（3 分钟前）`。点击执行 `agent-status open`。
+- `agent-status open`：执行 `jump`，同时把该会话标成 `seen=true`，蓝色就从徽标上消失。黄色不受影响，要等真正处理完才清除。
 - 底部提供"全部标为已读"和"清理过期会话"两个菜单项。
 
-**绿色在以下情况消失：** 在该会话里发下一条消息（`UserPromptSubmit`）；从菜单点进去；超过 TTL（默认 2 小时）。
+**蓝色消失的情况：** 在该会话里发下一条消息（`UserPromptSubmit`）；从菜单点进去；在 App 里点开它。已读的记录 5 小时后清理；黄色和蓝色没人看的话 24 小时后清理。
+
+下拉菜单每行前面用 emoji 圆点（🟡🟢🔵）。SwiftBar 在下拉菜单里会把 `sfimage` 圆点画成纯黑色。插件头部设置了 `hideSwiftBar`、`hideAbout` 等，去掉 SwiftBar 自带的菜单项。
 
 以后想去掉 SwiftBar 依赖，可以写一个原生 Swift 小程序（`NSStatusItem` + `DispatchSource` 监听目录），继续读同一个状态目录。
 
@@ -121,10 +145,11 @@ agent-status/
 5. ✅ SwiftBar 2.1.1 在菜单栏里不认单独的 `sfcolor`，要用 base64 编码的 `sfconfig`（`renderingMode: Palette`）才能显示颜色。
 6. ✅ 深链接会把 App 切到对应会话，但如果你正在用别的 App，它的窗口不会到最前面，`open -b` 也拉不上来。所以点击后再用 AppleScript 的 `tell application id … to activate` 激活一次，这样可以。
 7. ✅ 子进程会继承 `CLAUDE_CODE_HOST_SESSION_ID`（比如在 Desktop 会话里启动的 codex 或 claude）。所以只有 `CLAUDE_CODE_ENTRYPOINT=claude-desktop` 时才生成 Desktop 会话的跳转链接。
-8. ⏳ Codex App 里真实会话的 hook 环境变量（`CODEX_INTERNAL_ORIGINATOR_OVERRIDE`）还没见到实际值，是根据 App 代码推断的。下次在 App 里用 Codex 时，打开 `.debug` 就能确认。如果推断不对，会退回用 `__CFBundleIdentifier` 激活 Codex App，不会跳到具体会话。
+8. ✅ Codex App 里真实会话的 hook 环境变量是 `CODEX_INTERNAL_ORIGINATOR_OVERRIDE=Codex Desktop`（和从 App 代码里推断的 `codex_work_desktop` 不一样），判断时不区分大小写。App 退出时会给会话发 `SessionEnd(other)`；Claude Desktop 重启时也一样，重新打开会话时再发 `SessionStart(resume)`。
 
 ## 7. 已知限制
 
-- 在 Claude 里按 Esc 中断不会触发 `Stop`，状态会停在 running，直到下一条消息或 TTL 到期。Codex 有 `Interrupt` 事件，不受影响。
-- 审批被拒绝时不会触发 `PostToolUse`。Codex 会触发 `Interrupt`，状态回到灰色；Claude 这边红色会一直保留，直到 `Stop` 或下一条消息。
+- Claude 里按 Esc 中断、拒绝审批都不发 hook，要等下次菜单刷新读到对话记录才从徽标上消失。hook 触发了别的会话会立即刷新，否则最多等 1 分钟（SwiftBar 的兜底刷新周期）。
+- 如果你一直看着某个 Desktop 会话、但 Desktop 不在最前面时它完成了，会记成未读，直到你切走再切回来、点菜单或发下一条消息。
+- Desktop 会话文件、对话记录格式、Codex 数据库表结构都是应用内部的东西，升级后可能变化。读不到时只是少了校正，hook 那部分照常工作。
 - 深链接属于两个应用的内部接口，没有公开文档，升级后可能失效。所以 `agent-status open` 在链接打不开时，至少要把对应应用切到前台。

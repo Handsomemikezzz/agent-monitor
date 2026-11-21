@@ -5,5 +5,7 @@
 # <swiftbar.hideRunInTerminal>true</swiftbar.hideRunInTerminal>
 # <swiftbar.hideLastUpdated>true</swiftbar.hideLastUpdated>
 # <swiftbar.hideDisablePlugin>true</swiftbar.hideDisablePlugin>
+# <swiftbar.hideSwiftBar>true</swiftbar.hideSwiftBar>
+# <swiftbar.hideAbout>true</swiftbar.hideAbout>
 AGENT_STATUS_BIN="${AGENT_STATUS_BIN:-$HOME/agent-status/bin/agent-status}"
 exec "$AGENT_STATUS_BIN" menu

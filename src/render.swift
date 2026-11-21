@@ -1,7 +1,7 @@
-// Draws the menu bar badge: three rounded boxes with a count in each,
-// waiting (red) · done (green) · other sessions (grey).
+// Draws the menu bar badge: one rounded pill split into three coloured segments,
+// each holding a count: waiting for you (yellow) · running (green) · done, unread (blue).
 //
-//   agent-status-render 2 1 0   → prints a base64 PNG on stdout
+//   agent-status-render 2 1 3   → prints a base64 PNG on stdout
 //
 // The PNG is drawn at 2x and tagged 144 dpi, so it shows crisp at its point size.
 // Built once by `agent-status install` with: swiftc -O src/render.swift -o build/agent-status-render
@@ -16,17 +16,16 @@ func color(_ hex: String) -> NSColor {
                    blue: CGFloat(v & 0xff) / 255, alpha: 1)
 }
 
-let boxes: [(fill: String, stroke: String)] = [
-    ("#FFC9C9", "#E03131"),  // waiting for you
-    ("#B2F2BB", "#2F9E44"),  // done, not seen yet
-    ("#E9ECEF", "#ADB5BD"),  // everything else
+let segments: [(fill: String, edge: String)] = [
+    ("#FFE066", "#F59F00"),  // waiting for you
+    ("#B2F2BB", "#2F9E44"),  // running
+    ("#A5D8FF", "#1971C2"),  // done, not seen yet
 ]
 let counts = CommandLine.arguments.dropFirst().map { Int($0) ?? 0 }
 
-let boxW: CGFloat = 22, boxH: CGFloat = 17, gap: CGFloat = 2
-let lineW: CGFloat = 1.5, radius: CGFloat = 5, scale: CGFloat = 2
-let width = CGFloat(boxes.count) * boxW + CGFloat(boxes.count - 1) * gap
-let height: CGFloat = 18
+let segW: CGFloat = 21, pillH: CGFloat = 17, height: CGFloat = 18
+let lineW: CGFloat = 1.5, radius: CGFloat = 6, scale: CGFloat = 2
+let width = CGFloat(segments.count) * segW
 
 guard let rep = NSBitmapImageRep(
     bitmapDataPlanes: nil, pixelsWide: Int(width * scale), pixelsHigh: Int(height * scale),
@@ -45,16 +44,24 @@ func roundedFont(_ size: CGFloat) -> NSFont {
     return base
 }
 
-for (i, box) in boxes.enumerated() {
-    let x = CGFloat(i) * (boxW + gap)
-    let rect = NSRect(x: x + lineW / 2, y: (height - boxH) / 2 + lineW / 2,
-                      width: boxW - lineW, height: boxH - lineW)
-    let path = NSBezierPath(roundedRect: rect, xRadius: radius, yRadius: radius)
-    color(box.fill).setFill()
-    path.fill()
-    color(box.stroke).setStroke()
-    path.lineWidth = lineW
-    path.stroke()
+// The outline sits just inside the image so its stroke isn't cut off.
+let pill = NSRect(x: lineW / 2, y: (height - pillH) / 2 + lineW / 2,
+                  width: width - lineW, height: pillH - lineW)
+let outline = NSBezierPath(roundedRect: pill, xRadius: radius, yRadius: radius)
+outline.lineWidth = lineW
+
+for (i, seg) in segments.enumerated() {
+    let slice = NSRect(x: CGFloat(i) * segW, y: 0, width: segW, height: height)
+
+    // Fill this segment's share of the pill, then the outline over it in the
+    // segment's own colour, so the edge changes colour with the fill.
+    NSGraphicsContext.saveGraphicsState()
+    NSBezierPath(rect: slice).addClip()
+    color(seg.fill).setFill()
+    outline.fill()
+    color(seg.edge).setStroke()
+    outline.stroke()
+    NSGraphicsContext.restoreGraphicsState()
 
     let n = i < counts.count ? counts[i] : 0
     let text = n > 99 ? "99+" : String(n)
@@ -63,7 +70,7 @@ for (i, box) in boxes.enumerated() {
         .foregroundColor: color("#1E1E1E"),
     ]
     let size = text.size(withAttributes: attrs)
-    text.draw(at: NSPoint(x: rect.midX - size.width / 2, y: rect.midY - size.height / 2),
+    text.draw(at: NSPoint(x: slice.midX - size.width / 2, y: pill.midY - size.height / 2),
               withAttributes: attrs)
 }
 

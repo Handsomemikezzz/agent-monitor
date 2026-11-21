@@ -2,17 +2,19 @@
 
 A tiny macOS menu bar light for your **Claude Code** and **Codex** sessions.
 
-The menu bar shows three counts side by side:
+The menu bar shows one small pill with three counts:
 
 | Box | Counts sessions that… |
 |---|---|
-| 🟥 red | are waiting for you: a permission to approve, a question, a plan to review |
-| 🟩 green | finished and you haven't looked yet |
-| ⬜ grey | need nothing from you (running or idle) |
+| 🟨 yellow | are waiting for you: a permission to approve, a question, a plan to review |
+| 🟩 green | are running |
+| 🟦 blue | finished, and you haven't looked yet |
+
+Sessions you've already seen, and interrupted ones, aren't shown.
 
 Click the badge to see every session. Click a session to jump straight back to it in Claude Code Desktop or the Codex app (or to the terminal it runs in).
 
-There's no daemon and no polling. The agents' own hooks write one small JSON file per session, and SwiftBar redraws the menu only when a state changes.
+There's no daemon. The agents' own hooks write one small JSON file per session and ask SwiftBar to redraw at once. Each redraw also checks what the apps themselves recorded (see below), which catches what the hooks can't see.
 
 ## Requirements
 
@@ -39,16 +41,26 @@ It uses the same `codex app-server` API that the Codex app's **Settings → Hook
 
 ## How it works
 
+Hooks give the live signal:
+
 | Event | Claude Code | Codex | State |
 |---|---|---|---|
-| prompt sent, session started | `UserPromptSubmit`, `SessionStart` | same | running (grey) |
-| approval or question | `PermissionRequest`, `PreToolUse` (AskUserQuestion / ExitPlanMode), `Notification` | `PermissionRequest` | **waiting (red)** |
+| prompt sent | `UserPromptSubmit` | same | **running (green)** |
+| approval or question | `PermissionRequest`, `PreToolUse` (AskUserQuestion / ExitPlanMode), `Notification` | `PermissionRequest` | **waiting (yellow)** |
 | tool finished after approval | `PostToolUse` | `PostToolUse` | back to running |
-| turn finished | `Stop` | `Stop` | **done (green)** |
-| interrupted | – | `Interrupt` | grey |
-| session closed | `SessionEnd` | `SessionEnd` | removed |
+| turn finished | `Stop` | `Stop` | **done (blue until seen)** |
+| interrupted | – | `Interrupt` | not shown |
+| session closed | `SessionEnd` (CLI) · archived (Desktop) | `SessionEnd` (CLI) · archived (app) | not shown |
 
-A green light goes back to grey when you send that session a new message, when you click it in the menu, or after 2 hours. Sessions with no events for 12 hours are forgotten.
+The Claude and Codex apps send `SessionEnd` every time they quit and `SessionStart` when they reopen a session, so for app sessions neither one changes the state; archiving does.
+
+Some changes send no hook at all: pressing Esc in Claude Code, denying an approval, or a session that hasn't fired a hook since you installed. So every redraw also reads, for sessions active recently:
+
+- **The end of each transcript** (`~/.claude/projects/…`, `~/.codex/sessions/…`): did the last turn finish, get interrupted, or is it still going? When the transcript is newer than the last hook event, it wins. Approvals and questions only come from hooks.
+- **Claude Desktop's session files** (`~/Library/Application Support/Claude/claude-code-sessions/`): the session title, whether it's archived, and when you last opened it. A finished session you've opened since counts as seen.
+- **Codex's state database** (`~/.codex/state_*.sqlite`, read-only): the thread title, whether it's archived, and the Codex app's own read/unread mark.
+
+A blue session counts as seen, and leaves the badge, when you click it in the menu, open it in the app, or send it a new message. Yellow and blue sessions nobody looks at are cleared after 24 hours. A running session with no sign of life for 30 minutes stops counting as running.
 
 Jump targets are worked out when the hook fires:
 
@@ -62,7 +74,7 @@ These deep links aren't documented by either app, so if one stops working, click
 
 ```sh
 bin/agent-status status      # current sessions as JSON
-bin/agent-status seen-all    # turn every green light grey
+bin/agent-status seen-all    # mark every finished session as seen
 bin/agent-status uninstall   # remove the hooks and the plugin
 ```
 

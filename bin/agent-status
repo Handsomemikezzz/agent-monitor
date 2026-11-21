@@ -14,7 +14,9 @@ Only the Python standard library is used, so it runs on the system /usr/bin/pyth
 """
 
 import base64
+import calendar
 import fcntl
+import glob
 import json
 import os
 import subprocess
@@ -26,9 +28,14 @@ SELF = os.path.realpath(__file__)
 PLUGIN_NAME = "agent-status"
 HOOK_MARKER = "agent-status\" hook"  # how our hook commands are recognised on uninstall
 
-DONE_TTL = 2 * 3600        # a finished session stops being green after this
-STALE_TTL = 12 * 3600      # a session with no event for this long is forgotten
-WAITING_TTL = 24 * 3600
+READ_TTL = 5 * 3600        # a grey (finished and seen) session is cleared after this
+RUNNING_TTL = 30 * 60      # a running session with no sign of life for this long counts as idle
+ATTENTION_TTL = 24 * 3600  # a red or blue session nobody looked at is cleared after this
+
+# What the apps themselves record, read to correct and complete what the hooks saw.
+CLAUDE_DESKTOP_SESSIONS = "~/Library/Application Support/Claude/claude-code-sessions"
+CLAUDE_PROJECTS = "~/.claude/projects"
+CODEX_HOME = os.environ.get("CODEX_HOME", "~/.codex")
 
 CLAUDE_BUNDLE = "com.anthropic.claudefordesktop"
 CODEX_BUNDLE = "com.openai.codex"
@@ -39,7 +46,11 @@ WAIT_NOTIFICATIONS = {
     "elicitation_dialog", "elicitation_url_dialog", "agent_needs_input",
 }
 
-COLORS = {"waiting": "#E03131", "done": "#2F9E44", "idle": "#ADB5BD", "running": "#ADB5BD"}
+# What each session counts as, in badge order: red, green, blue, grey.
+# "read" (finished and seen, or interrupted) is kept on disk but not shown.
+KINDS = ("waiting", "running", "unread")
+COLORS = {"waiting": "#F59F00", "running": "#2F9E44", "unread": "#1971C2", "read": "#ADB5BD"}
+EMOJI = {"waiting": "🟡", "running": "🟢", "unread": "🔵"}
 RENDERER = os.path.join(os.path.dirname(os.path.dirname(SELF)), "build", "agent-status-render")
 
 
@@ -110,22 +121,24 @@ class Lock:
 
 
 def color_of(rec):
-    """The colour a single session contributes: waiting / done / idle."""
+    """What a single session counts as: waiting / running / unread / read."""
     st = rec.get("state")
     if st == "waiting":
         return "waiting"
+    if st == "running":
+        return "running"
     if st == "done" and not rec.get("seen"):
-        return "done"
-    return "idle"
+        return "unread"
+    return "read"  # finished and seen, or interrupted
 
 
 def overall(records):
+    """The single colour used when the badge can't be drawn: red > blue > green > grey."""
     colors = [color_of(r) for r in records]
-    if "waiting" in colors:
-        return "waiting", colors.count("waiting")
-    if "done" in colors:
-        return "done", colors.count("done")
-    return "idle", 0
+    for c in ("waiting", "unread", "running"):
+        if c in colors:
+            return c, colors.count(c)
+    return "read", 0
 
 
 def refresh_menu():
@@ -154,7 +167,8 @@ def jump_target(tool, sid):
             return {"kind": "url", "target": "claude://claude.ai/epitaxy/" + host,
                     "fallback": CLAUDE_BUNDLE}
     if tool == "codex":
-        if env.get("CODEX_INTERNAL_ORIGINATOR_OVERRIDE", "").endswith("desktop"):
+        # Seen in practice: "Codex Desktop".
+        if env.get("CODEX_INTERNAL_ORIGINATOR_OVERRIDE", "").lower().endswith("desktop"):
             return {"kind": "url", "target": "codex://threads/" + sid, "fallback": CODEX_BUNDLE}
     # Started from a terminal: bring that terminal app forward.
     bundle = env.get("__CFBundleIdentifier")
@@ -166,8 +180,14 @@ def jump_target(tool, sid):
 def next_state(event, data, cur):
     """Return (state, reason) for this event, None to leave it, or 'delete'."""
     st = cur.get("state") if cur else None
-    if event in ("SessionStart", "UserPromptSubmit"):
+    if event == "UserPromptSubmit":
         return ("running", "")
+    if event == "SessionStart":
+        # Also sent when Desktop resumes an old session or a turn compacts: not a new
+        # turn. A session we don't know yet gets its state from its transcript.
+        if cur and not cur.get("hidden"):
+            return None
+        return (st, cur.get("reason", "") if cur else "")
     tool = data.get("tool_name", "")
     if event in ("PreToolUse", "PermissionRequest") and tool in ASK_TOOLS:
         # Claude Desktop sends PermissionRequest for its question tools too.
@@ -182,14 +202,19 @@ def next_state(event, data, cur):
             return ("waiting", "permission")
         return None
     if event in ("PostToolUse", "PostToolUseFailure"):
-        # Only clears an approval/question; never overrides a finished turn.
-        return ("running", "") if st == "waiting" else None
+        # Clears an approval/question, and shows a running turn is still alive.
+        # Never overrides a finished turn.
+        if st == "waiting":
+            return ("running", "")
+        if st == "idle" or (st == "running" and time.time() - cur.get("updated_at", 0) > 60):
+            return ("running", "")
+        return None
     if event == "Stop":
         return ("done", "")
     if event == "Interrupt":
         return ("idle", "interrupted")
     if event == "SessionEnd":
-        return "delete"
+        return "ended"
     return None
 
 
@@ -227,14 +252,23 @@ def cmd_hook(tool):
         nxt = next_state(event, data, cur)
         if nxt is None:
             return
-        if nxt == "delete":
-            if cur:
-                remove(key)
+        if nxt == "ended":
+            # Kept, hidden, so the transcript scan doesn't bring it back. Not for
+            # Desktop / Codex app sessions: the apps end them on every quit and
+            # resume them later; archiving is what really closes them there.
+            if cur and (cur.get("jump") or {}).get("kind") == "url":
+                return
+            if cur and not cur.get("hidden"):
+                cur["hidden"] = True
+                save(key, cur)
                 refresh_menu()
             return
         state, reason = nxt
-        before = color_of(cur) if cur else None
+        before = color_of(cur) if cur and not cur.get("hidden") else None
         rec = dict(cur or {})
+        rec.pop("hidden", None)
+        if data.get("transcript_path"):
+            rec["transcript"] = data["transcript_path"]
         cwd = data.get("cwd") or rec.get("cwd") or ""
         rec.update({
             "tool": tool,
@@ -258,6 +292,9 @@ def cmd_hook(tool):
             rec["prompt"] = line[:60]
         if state == "done":
             rec["seen"] = False
+            rec.pop("seen_at", None)
+            if tool == "claude" and _desktop_on_screen(rec):
+                rec["seen"], rec["seen_at"] = True, int(time.time())
         elif state in ("running", "idle"):
             rec["seen"] = True
         save(key, rec)
@@ -271,11 +308,11 @@ LANG = "zh" if os.environ.get("AGENT_STATUS_LANG", "").startswith("zh") else "en
 T = {
     "en": {"permission": "needs approval", "question": "has a question", "plan": "plan to review",
            "done": "done", "running": "running", "idle": "idle", "interrupted": "interrupted",
-           "none": "No sessions yet", "seen_all": "Mark all as seen", "folder": "Open state folder",
+           "none": "Nothing running or waiting", "seen_all": "Mark all as seen", "folder": "Open state folder",
            "now": "now", "m": "m ago", "h": "h ago"},
     "zh": {"permission": "等待审批", "question": "有问题要问你", "plan": "等待确认计划",
            "done": "已完成", "running": "运行中", "idle": "空闲", "interrupted": "已中断",
-           "none": "暂无会话", "seen_all": "全部标为已读", "folder": "打开状态目录",
+           "none": "没有运行中或待处理的会话", "seen_all": "全部标为已读", "folder": "打开状态目录",
            "now": "刚刚", "m": " 分钟前", "h": " 小时前"},
 }[LANG]
 
@@ -289,21 +326,235 @@ def ago(ts):
     return "%d%s" % (d // 3600, T["h"])
 
 
-def prune(records):
-    """Drop forgotten sessions and let old green ones fade to grey."""
-    now = time.time()
-    kept = []
-    for r in records:
-        age = now - r.get("updated_at", 0)
-        limit = WAITING_TTL if r.get("state") == "waiting" else STALE_TTL
-        if age > limit:
-            remove(r["_key"])
+# ---------------------------------------------------------------- what the apps record
+#
+# Hooks give the live signal, and are the only way to see an approval or a question.
+# But a session that hasn't fired a hook since install is invisible to them, and some
+# changes send no hook at all (Esc in Claude Code, a denied approval). So every menu
+# refresh also reads, for recently active sessions:
+#   - the end of the transcript: did the last turn finish, get interrupted, or is it going?
+#   - Claude Desktop's session files: title, archived, when you last looked at it
+#   - Codex's state database: title, archived, and the app's own read/unread mark
+
+def _iso(ts):
+    try:
+        return calendar.timegm(time.strptime(str(ts)[:19], "%Y-%m-%dT%H:%M:%S"))
+    except ValueError:
+        return 0
+
+
+def _tail(path, size=256 * 1024):
+    """The last lines of a file, newest first."""
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, 2)
+            n = f.tell()
+            f.seek(max(0, n - size))
+            lines = f.read().split(b"\n")
+    except OSError:
+        return []
+    return (lines[1:] if n > size else lines)[::-1]
+
+
+def claude_turn(path):
+    """(state, reason, time) of the last turn in a Claude Code transcript, or None."""
+    for raw in _tail(path):
+        if not raw.strip():
             continue
-        if r.get("state") == "done" and not r.get("seen") and age > DONE_TTL:
-            r["seen"] = True
-            save(r["_key"], {k: v for k, v in r.items() if k != "_key"})
-        kept.append(r)
-    return kept
+        try:
+            d = json.loads(raw)
+        except ValueError:
+            continue
+        kind, ts = d.get("type"), _iso(d.get("timestamp"))
+        if kind == "system":
+            if d.get("subtype") in ("stop_hook_summary", "turn_duration"):
+                return ("done", "", ts)
+        elif kind == "assistant":
+            if (d.get("message") or {}).get("stop_reason") in ("end_turn", "stop_sequence"):
+                return ("done", "", ts)
+            return ("running", "", ts)
+        elif kind == "user" and not d.get("isMeta"):
+            if b"[Request interrupted by user" in raw:  # Esc, or a denied approval
+                return ("idle", "interrupted", ts)
+            if b"<local-command-stdout>" in raw:  # a slash command that ran no turn
+                continue
+            return ("running", "", ts)
+    return None
+
+
+def codex_turn(path):
+    """(state, reason, time) of the last turn in a Codex rollout file, or None."""
+    for raw in _tail(path):
+        if b'"event_msg"' not in raw:
+            continue
+        try:
+            d = json.loads(raw)
+        except ValueError:
+            continue
+        kind, ts = (d.get("payload") or {}).get("type"), _iso(d.get("timestamp"))
+        if kind == "task_complete":
+            return ("done", "", ts)
+        if kind == "turn_aborted":
+            return ("idle", "interrupted", ts)
+        if kind in ("task_started", "turn_started"):
+            return ("running", "", ts)
+    return None
+
+
+def desktop_sessions(since):
+    """Claude Desktop's own session files, by CLI session id."""
+    out = {}
+    pattern = os.path.join(os.path.expanduser(CLAUDE_DESKTOP_SESSIONS), "*", "*", "local_*.json")
+    for f in glob.glob(pattern):
+        try:
+            if os.path.getmtime(f) < since:
+                continue
+            with open(f) as fh:
+                d = json.load(fh)
+        except (OSError, ValueError):
+            continue
+        if d.get("cliSessionId"):
+            out[d["cliSessionId"]] = d
+    return out
+
+
+def _desktop_on_screen(rec):
+    """True if this Desktop session is the one on screen right now, so its new
+    answer has already been seen."""
+    host = ((rec.get("jump") or {}).get("target") or "").rsplit("/", 1)[-1]
+    if not host.startswith("local_") or _frontmost() != CLAUDE_BUNDLE:
+        return False
+    sessions = desktop_sessions(time.time() - ATTENTION_TTL).values()
+    focus = {d.get("sessionId"): d.get("lastFocusedAt") or 0 for d in sessions}
+    return bool(focus) and focus.get(host, -1) >= max(focus.values())
+
+
+def _frontmost():
+    try:
+        asn = subprocess.run(["/usr/bin/lsappinfo", "front"], capture_output=True,
+                             text=True, timeout=1).stdout.strip()
+        out = subprocess.run(["/usr/bin/lsappinfo", "info", "-only", "bundleid", asn],
+                             capture_output=True, text=True, timeout=1).stdout
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return out.rsplit("=", 1)[-1].strip().strip('"') or None
+
+
+def codex_threads(since):
+    """Recent threads from Codex's state database, by thread id."""
+    import sqlite3
+    import urllib.request
+    dbs = glob.glob(os.path.join(os.path.expanduser(CODEX_HOME), "state_*.sqlite"))
+    if not dbs:
+        return {}
+    db = max(dbs, key=lambda p: int("".join(c for c in os.path.basename(p) if c.isdigit()) or 0))
+    try:
+        con = sqlite3.connect("file:%s?mode=ro" % urllib.request.pathname2url(db),
+                              uri=True, timeout=1)
+        rows = con.execute(
+            "SELECT t.id, t.rollout_path, t.cwd, COALESCE(NULLIF(t.name, ''), t.title),"
+            " t.archived, t.originator, t.thread_source, r.first_unread_turn"
+            " FROM threads t LEFT JOIN thread_read_receipts r ON r.thread_id = t.id"
+            " WHERE t.updated_at_ms >= ?", (int(since * 1000),)).fetchall()
+        con.close()
+    except Exception:  # the schema is Codex's own and may change
+        return {}
+    return {r[0]: {"rollout": r[1], "cwd": r[2], "title": r[3], "archived": bool(r[4]),
+                   "originator": r[5] or "", "source": r[6] or "", "unread": bool(r[7])}
+            for r in rows}
+
+
+def _new_record(tool, sid, cwd):
+    return {"tool": tool, "session_id": sid, "state": None, "reason": "", "cwd": cwd or "",
+            "title": os.path.basename((cwd or "").rstrip("/")) or tool, "updated_at": 0,
+            "seen": True}
+
+
+def collect():
+    """All sessions worth showing, with hook state corrected by what the apps record.
+    Writes back what changed. Call with the lock held."""
+    now = time.time()
+    recs = {r.pop("_key"): r for r in all_records()}
+    before = {k: json.dumps(r, sort_keys=True) for k, r in recs.items()}
+    extra = {}  # per-session facts for this pass only
+
+    for sid, d in desktop_sessions(now - ATTENTION_TTL).items():
+        key = "claude-" + _safe(sid)
+        active = (d.get("lastActivityAt") or 0) / 1000
+        if key not in recs:
+            if d.get("isArchived") or active < now - READ_TTL:
+                continue
+            rec = recs[key] = _new_record("claude", sid, d.get("cwd"))
+            found = glob.glob(os.path.join(os.path.expanduser(CLAUDE_PROJECTS), "*", sid + ".jsonl"))
+            if found:
+                rec["transcript"] = found[0]
+        rec = recs[key]
+        rec["jump"] = {"kind": "url", "target": "claude://claude.ai/epitaxy/" + d["sessionId"],
+                       "fallback": CLAUDE_BUNDLE}
+        if d.get("title"):
+            rec["name"] = d["title"]
+        if d.get("isArchived"):
+            rec["hidden"] = True
+        extra[key] = {"focused": (d.get("lastFocusedAt") or 0) / 1000}
+
+    for tid, t in codex_threads(now - ATTENTION_TTL).items():
+        key = "codex-" + _safe(tid)
+        if key not in recs:
+            if t["archived"] or t["source"] != "user" or t["originator"] == "codex_exec":
+                continue
+            recs[key] = _new_record("codex", tid, t["cwd"])
+        rec = recs[key]
+        if t["rollout"]:
+            rec.setdefault("transcript", t["rollout"])
+        if t["title"]:
+            rec["name"] = t["title"].strip().splitlines()[0]
+        if t["archived"]:
+            rec["hidden"] = True
+        if t["originator"] == "Codex Desktop":
+            rec["jump"] = {"kind": "url", "target": "codex://threads/" + tid,
+                           "fallback": CODEX_BUNDLE}
+            extra[key] = {"read": not t["unread"]}
+
+    for key, rec in recs.items():
+        path = rec.get("transcript")
+        mtime = os.path.getmtime(path) if path and os.path.exists(path) else 0
+        turn = (claude_turn if rec.get("tool") == "claude" else codex_turn)(path) if mtime else None
+        # The transcript wins only when it's newer than the last hook event; the
+        # hook stays the authority on approvals and questions.
+        if turn and (rec.get("state") is None or turn[2] > rec.get("updated_at", 0) + 2):
+            state, reason, ts = turn
+            if state != rec.get("state"):
+                rec["state"], rec["reason"] = state, reason
+                rec.pop("detail", None)
+                rec["seen"] = state != "done"  # a finish the hooks missed is still news
+                rec.pop("seen_at", None)
+            rec["updated_at"] = max(rec.get("updated_at", 0), ts)
+        if rec.get("state") is None:
+            rec["state"] = "idle"
+            rec["updated_at"] = int(mtime or now)
+        # You looked at it in the app after it finished.
+        x = extra.get(key, {})
+        if rec["state"] == "done" and not rec.get("seen"):
+            if x.get("focused", 0) >= rec.get("updated_at", 0) or x.get("read"):
+                rec["seen"], rec["seen_at"] = True, int(now)
+        if rec["state"] == "running" and now - max(rec.get("updated_at", 0), mtime) > RUNNING_TTL:
+            # Nothing has happened for a long time: the process probably went away.
+            rec["state"], rec["reason"] = "idle", ""
+
+    shown = []
+    for key, rec in recs.items():
+        kind = color_of(rec)
+        age = now - max(rec.get("updated_at", 0), rec.get("seen_at", 0))
+        ttl = READ_TTL if rec.get("hidden") or kind in ("read", "running") else ATTENTION_TTL
+        if age > ttl:
+            remove(key)
+            continue
+        if json.dumps(rec, sort_keys=True) != before.get(key):
+            save(key, rec)
+        if not rec.get("hidden"):
+            rec["_key"] = key
+            shown.append(rec)
+    return shown
 
 
 def _q(s):
@@ -314,19 +565,19 @@ def _clean(s):
     return str(s).replace("|", "/").replace("\n", " ")
 
 
-def render_badge(waiting, done, other):
-    """Base64 PNG of the three count boxes, cached per combination of counts."""
+def render_badge(counts):
+    """Base64 PNG of the four count boxes, cached per combination of counts."""
     if not os.access(RENDERER, os.X_OK):
         return None
     cache = os.path.join(STATE_DIR, "cache")
-    path = os.path.join(cache, "%d-%d-%d.b64" % (waiting, done, other))
+    path = os.path.join(cache, "-".join(str(n) for n in counts) + ".b64")
     try:
         with open(path) as f:
             return f.read().strip()
     except OSError:
         pass
     try:
-        out = subprocess.run([RENDERER, str(waiting), str(done), str(other)],
+        out = subprocess.run([RENDERER] + [str(n) for n in counts],
                              capture_output=True, text=True, timeout=5).stdout.strip()
     except (OSError, subprocess.SubprocessError):
         return None
@@ -339,16 +590,16 @@ def render_badge(waiting, done, other):
 
 def cmd_menu():
     with Lock():
-        records = prune(all_records())
+        records = [r for r in collect() if color_of(r) in KINDS]
     color, count = overall(records)
     colors = [color_of(r) for r in records]
-    badge = render_badge(colors.count("waiting"), colors.count("done"), colors.count("idle"))
+    badge = render_badge([colors.count(k) for k in KINDS])
     if badge:
         print("| image=" + badge)
     else:  # renderer not built: a single coloured dot with the count
         print("%s | %s" % (str(count) if count else "", dot(color)))
     print("---")
-    order = {"waiting": 0, "done": 1, "idle": 2}
+    order = {"waiting": 0, "unread": 1, "running": 2}
     records.sort(key=lambda r: (order[color_of(r)], -r.get("updated_at", 0)))
     if not records:
         print("%s | color=gray" % T["none"])
@@ -358,14 +609,18 @@ def cmd_menu():
             status = T.get(r.get("reason"), T["permission"])
             if r.get("detail"):
                 status += " · " + r["detail"]
-        elif r.get("state") == "done":
+        elif c == "unread":
             status = T["done"]
         else:
-            status = T.get(r.get("reason") or r.get("state"), T["idle"])
+            status = T["running"]
         tool = "Claude" if r.get("tool") == "claude" else "Codex"
-        label = "%s · %s — %s (%s)" % (tool, r.get("title", ""), status, ago(r.get("updated_at")))
-        line = "%s | bash=%s param1=open param2=%s terminal=false refresh=true " \
-               "%s" % (_clean(label), _q(SELF), r["_key"], dot(c))
+        name = r.get("name") or r.get("title") or ""
+        if len(name) > 28:
+            name = name[:27] + "…"
+        # An emoji dot: SwiftBar draws sfimage dots in the dropdown in plain black.
+        label = "%s %s · %s — %s (%s)" % (EMOJI[c], tool, name, status, ago(r.get("updated_at")))
+        line = "%s | bash=%s param1=open param2=%s terminal=false refresh=true" % (
+            _clean(label), _q(SELF), r["_key"])
         if r.get("prompt"):
             line += " tooltip=%s" % _q(_clean(r["prompt"]))
         print(line)
@@ -392,8 +647,8 @@ def cmd_open(key):
         rec = load(key)
         if not rec:
             return
-        if rec.get("state") == "done":
-            rec["seen"] = True
+        if rec.get("state") == "done" and not rec.get("seen"):
+            rec["seen"], rec["seen_at"] = True, int(time.time())
             save(key, rec)
     jump = rec.get("jump") or {}
     default = CLAUDE_BUNDLE if rec.get("tool") == "claude" else CODEX_BUNDLE
@@ -412,12 +667,13 @@ def cmd_seen_all():
     with Lock():
         for r in all_records():
             if r.get("state") == "done" and not r.get("seen"):
-                r["seen"] = True
+                r["seen"], r["seen_at"] = True, int(time.time())
                 save(r.pop("_key"), r)
 
 
 def cmd_status():
-    records = all_records()
+    with Lock():
+        records = collect()
     color, count = overall(records)
     print(json.dumps({"overall": color, "count": count,
                       "sessions": [{k: v for k, v in r.items() if k != "_key"} for r in records]},
@@ -561,7 +817,8 @@ def cmd_install():
             f.write("#!/bin/sh\n# <swiftbar.hideRunInTerminal>true</swiftbar.hideRunInTerminal>\n"
                     "# <swiftbar.hideLastUpdated>true</swiftbar.hideLastUpdated>\n"
                     "# <swiftbar.hideDisablePlugin>true</swiftbar.hideDisablePlugin>\n"
-                    "# <swiftbar.hideSwiftBar>false</swiftbar.hideSwiftBar>\n"
+                    "# <swiftbar.hideSwiftBar>true</swiftbar.hideSwiftBar>\n"
+                    "# <swiftbar.hideAbout>true</swiftbar.hideAbout>\n"
                     "export AGENT_STATUS_LANG=%s\nexec \"%s\" menu\n" % (_system_lang(), SELF))
         os.chmod(plugin, 0o755)
         print("  wrote:  " + plugin)
