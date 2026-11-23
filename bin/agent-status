@@ -207,7 +207,7 @@ def cmd_hook(tool, raw, event=""):
             # so a turn that was running or waiting has stopped.
             if cur and (cur.get("jump") or {}).get("kind") == "url":
                 if cur.get("state") in ("running", "waiting"):
-                    cur.update(state="idle", reason="", updated_at=int(time.time()))
+                    cur.update(state="idle", reason="", updated_at=int(time.time()), since=int(time.time()))
                     cur.pop("detail", None)
                     save(key, cur)
                 return
@@ -221,6 +221,12 @@ def cmd_hook(tool, raw, event=""):
         if ev.get("transcript"):
             rec["transcript"] = ev["transcript"]
         cwd = ev.get("cwd") or rec.get("cwd") or ""
+        if state != rec.get("state") or "since" not in rec:
+            # When it entered this state. The panel sorts by it, so a running session
+            # doesn't jump around (under your mouse) on every tool call.
+            rec["since"] = int(time.time())
+        if ev["kind"] in ("start", "prompt", "working") or "pid" not in rec:
+            rec.update(agent.process() or {})
         rec.update({
             "tool": tool,
             "session_id": ev["sid"],
@@ -306,6 +312,145 @@ def _sqlite_rows(pattern, query, params):
         return []
 
 
+def _local_storage(path, key):
+    """A value from a Chromium app's Local Storage (a LevelDB folder), or None if it
+    can't be read. Reads the files directly; only enough of LevelDB for that."""
+    import struct
+
+    def varint(b, i):
+        r = s = 0
+        while True:
+            x = b[i]
+            i += 1
+            r |= (x & 0x7F) << s
+            s += 7
+            if x < 0x80:
+                return r, i
+
+    def snappy(b):
+        _, i = varint(b, 0)
+        out = bytearray()
+        while i < len(b):
+            t, k = b[i], b[i] & 3
+            i += 1
+            if k == 0:  # literal
+                n = t >> 2
+                if n >= 60:
+                    n, i = int.from_bytes(b[i:i + n - 59], "little"), i + n - 59
+                out += b[i:i + n + 1]
+                i += n + 1
+                continue
+            if k == 1:
+                n, off, i = ((t >> 2) & 7) + 4, ((t >> 5) << 8) | b[i], i + 1
+            else:
+                w = 2 if k == 2 else 4
+                n, off, i = (t >> 2) + 1, int.from_bytes(b[i:i + w], "little"), i + w
+            for _ in range(n):
+                out.append(out[-off])
+        return bytes(out)
+
+    def entries(block):
+        restarts = struct.unpack("<I", block[-4:])[0]
+        end, i, k = len(block) - 4 - 4 * restarts, 0, b""
+        while i < end:
+            shared, i = varint(block, i)
+            fresh, i = varint(block, i)
+            n, i = varint(block, i)
+            k = k[:shared] + block[i:i + fresh]
+            i += fresh
+            yield k, block[i:i + n]
+            i += n
+
+    def table(f):  # an .ldb file: index block -> data blocks of internal keys
+        def read(h):
+            off, j = varint(h, 0)
+            size, _ = varint(h, j)
+            f.seek(off)
+            raw = f.read(size + 1)
+            return snappy(raw[:size]) if raw[size] == 1 else raw[:size]
+        f.seek(-48, 2)
+        foot = f.read(48)
+        _, j = varint(foot, 0)
+        _, j = varint(foot, j)
+        for _, handle in entries(read(foot[j:])):
+            for ik, v in entries(read(handle)):
+                tag = struct.unpack("<Q", ik[-8:])[0]
+                yield ik[:-8], tag >> 8, tag & 0xFF, v
+
+    def log(f):  # a .log file: write batches split into 32 KB blocks
+        data, i, batch, batches = f.read(), 0, b"", []
+        while i + 7 <= len(data):
+            if 32768 - i % 32768 < 7:
+                i += 32768 - i % 32768
+                continue
+            n, kind = struct.unpack("<H", data[i + 4:i + 6])[0], data[i + 6]
+            batch = (batch if kind in (3, 4) else b"") + data[i + 7:i + 7 + n]
+            if kind in (1, 4):
+                batches.append(batch)
+            i += 7 + n
+        for b in batches:
+            seq, count = struct.unpack("<QI", b[:12])
+            j = 12
+            for n in range(count):
+                kind = b[j]
+                size, j = varint(b, j + 1)
+                k, j = b[j:j + size], j + size
+                v = b""
+                if kind == 1:
+                    size, j = varint(b, j)
+                    v, j = b[j:j + size], j + size
+                yield k, seq + n, kind, v
+
+    want = b"_https://claude.ai\x00\x01" + key.encode()
+    best = None
+    try:
+        for name in os.listdir(path):
+            if name.endswith((".ldb", ".log")):
+                with open(os.path.join(path, name), "rb") as f:
+                    for k, seq, kind, v in (table(f) if name.endswith(".ldb") else log(f)):
+                        if k == want and (best is None or seq > best[0]):
+                            best = (seq, kind, v)
+    except Exception:  # mid-compaction, or a format we don't know
+        return None
+    if not best or best[1] != 1:
+        return None
+    v = best[2]
+    return v[1:].decode("latin-1") if v[:1] == b"\x01" else v[1:].decode("utf-16-le", "replace")
+
+
+def _ancestor(names):
+    """(pid, start) of the nearest process above this hook whose name starts with one
+    of `names`: the agent that ran the hook. None if there isn't one."""
+    try:
+        out = subprocess.run(["/bin/ps", "-A", "-o", "pid=,ppid=,lstart=,comm="],
+                             capture_output=True, text=True, timeout=2).stdout
+    except (OSError, subprocess.SubprocessError):
+        return None
+    procs = {}
+    for line in out.splitlines():
+        p = line.split(None, 7)
+        if len(p) == 8:
+            procs[int(p[0])] = (int(p[1]), " ".join(p[2:7]), os.path.basename(p[7]))
+    pid, seen = os.getppid(), set()
+    while pid in procs and pid not in seen and pid > 1:
+        seen.add(pid)
+        ppid, start, comm = procs[pid]
+        if comm.startswith(names):
+            return pid, start
+        pid = ppid
+    return None
+
+
+def _proc_start(pid):
+    """When process `pid` started, or "" if it isn't running."""
+    try:
+        out = subprocess.run(["/bin/ps", "-o", "lstart=", "-p", str(int(pid))], capture_output=True,
+                             text=True, timeout=2).stdout
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return ""
+    return " ".join(out.split())
+
+
 def _new_record(tool, sid, cwd):
     return {"tool": tool, "session_id": sid, "state": None, "reason": "", "cwd": cwd or "",
             "title": os.path.basename((cwd or "").rstrip("/")) or tool, "updated_at": 0,
@@ -343,7 +488,17 @@ class Agent:
 
     def scan(self, recs, now, facts):
         """Add or correct records from the agent's own records. `facts[key]` takes
-        {"focused": time you last opened it} or {"read": True}."""
+        "focused" (when you last opened it), "read" (the app says it's read) and
+        "unread" (the app's own unread mark, for finishes the hooks didn't see)."""
+
+    def process(self):
+        """Called in a hook: fields to keep on the record that identify the process
+        running the session, so alive() can tell when it's gone. None if unknown."""
+        return None
+
+    def alive(self, rec):
+        """False when a terminal session's process is gone; None if we can't tell."""
+        return None
 
     def on_screen(self, rec):
         """True if a turn that just finished was already on screen, so it's seen."""
@@ -463,7 +618,10 @@ class Claude(Agent):
     name, label, bundle = "claude", "Claude", CLAUDE_BUNDLE
     SETTINGS = "~/.claude/settings.json"
     PROJECTS = "~/.claude/projects"
+    REGISTRY = "~/.claude/sessions"
     DESKTOP_SESSIONS = "~/Library/Application Support/Claude/claude-code-sessions"
+    DESKTOP_STORAGE = "~/Library/Application Support/Claude/Local Storage/leveldb"
+    _live = {}
     EVENTS = [
         ("SessionStart", None), ("UserPromptSubmit", None),
         ("PreToolUse", "AskUserQuestion|ExitPlanMode"), ("PermissionRequest", None),
@@ -523,7 +681,46 @@ class Claude(Agent):
                 out[d["cliSessionId"]] = d
         return out
 
+    def desktop_unread(self):
+        """Claude Desktop's own unread marks (its sidebar dots), by Desktop session id.
+        None if they can't be read."""
+        raw = _local_storage(os.path.expanduser(self.DESKTOP_STORAGE), "epitaxy-unread-v1")
+        try:
+            state = json.loads(raw)["state"]
+            return set(state.get("unreadIds") or []) | set(state.get("explicitUnreadIds") or [])
+        except (TypeError, ValueError, KeyError, AttributeError):
+            return None
+
+    def live_sessions(self):
+        """Claude Code's own registry of running sessions: session id -> pid. Each
+        process keeps a file there while it runs."""
+        out = {}
+        for f in glob.glob(os.path.join(os.path.expanduser(self.REGISTRY), "*.json")):
+            try:
+                with open(f) as fh:
+                    d = json.load(fh)
+                os.kill(int(d["pid"]), 0)
+            except PermissionError:
+                pass  # running, as another user
+            except (OSError, ValueError, KeyError, TypeError):
+                continue
+            out[d.get("sessionId")] = int(d["pid"])
+        return out
+
+    def alive(self, rec):
+        # Desktop sessions outlive their process: the app resumes them.
+        if (rec.get("jump") or {}).get("kind") == "url":
+            return None
+        pid = self._live.get(rec.get("session_id"))
+        if pid:
+            rec["pid"] = pid
+            return True
+        # Gone from the registry. Only trusted once we've seen it there.
+        return False if rec.get("pid") else None
+
     def scan(self, recs, now, facts):
+        self._live = self.live_sessions()
+        unread = self.desktop_unread()
         for sid, d in self.desktop_sessions(now - RECENT).items():
             key = "claude-" + _safe(sid)
             active = (d.get("lastActivityAt") or 0) / 1000
@@ -542,6 +739,8 @@ class Claude(Agent):
             if d.get("isArchived"):
                 rec["hidden"] = True
             facts[key] = {"focused": (d.get("lastFocusedAt") or 0) / 1000}
+            if unread is not None:
+                facts[key]["unread"] = d["sessionId"] in unread
 
     def on_screen(self, rec):
         """The Desktop session you were looking at when it finished."""
@@ -575,11 +774,25 @@ class Codex(Agent):
             return None
         return _claude_style_event(event, data)
 
-    def jump(self, sid, data):
+    @staticmethod
+    def in_app():
         # Seen in practice: "Codex Desktop".
-        if os.environ.get("CODEX_INTERNAL_ORIGINATOR_OVERRIDE", "").lower().endswith("desktop"):
+        return os.environ.get("CODEX_INTERNAL_ORIGINATOR_OVERRIDE", "").lower().endswith("desktop")
+
+    def jump(self, sid, data):
+        if self.in_app():
             return {"kind": "url", "target": "codex://threads/" + sid, "fallback": self.bundle}
         return _terminal_or(self.bundle)
+
+    def process(self):
+        # A terminal session lives as long as the codex process that runs its hooks.
+        found = None if self.in_app() else _ancestor(("codex",))
+        return {"pid": found[0], "pid_start": found[1]} if found else {"pid": 0}
+
+    def alive(self, rec):
+        if (rec.get("jump") or {}).get("kind") == "url" or not rec.get("pid"):
+            return None
+        return _proc_start(rec["pid"]) == rec.get("pid_start")
 
     def turn(self, path):
         for raw in _tail(path):
@@ -636,7 +849,7 @@ class Codex(Agent):
                 rec["hidden"] = True
             if originator == "Codex Desktop":
                 rec["jump"] = {"kind": "url", "target": "codex://threads/" + tid, "fallback": self.bundle}
-                facts[key] = {"read": not unread}
+                facts[key] = {"read": not unread, "unread": bool(unread)}
 
         for key in [k for k, r in recs.items() if r.get("tool") == "codex"]:
             rec = recs[key]
@@ -832,6 +1045,7 @@ def collect():
 
     for key, rec in recs.items():
         agent = AGENTS.get(rec.get("tool"))
+        x = facts.get(key, {})
         path = rec.get("transcript")
         mtime = os.path.getmtime(path) if path and os.path.exists(path) else 0
         turn = agent.turn(path) if agent and mtime else None
@@ -840,20 +1054,28 @@ def collect():
         if turn and (rec.get("state") is None or turn[2] > rec.get("updated_at", 0) + 2):
             state, reason, ts = turn
             if state != rec.get("state"):
+                # A finish is news only if we saw that turn running. One we learn about
+                # later (an old chat reopened, or found in the app's list) is unread
+                # only if the app itself marks it unread.
+                watched = rec.get("state") in ("running", "waiting")
+                rec["seen"] = state != "done" or not (watched or x.get("unread"))
                 rec["state"], rec["reason"] = state, reason
                 rec.pop("detail", None)
-                rec["seen"] = state != "done"  # a finish the hooks missed is still news
                 rec.pop("seen_at", None)
                 # The time it really happened, not when a later hook (say, Desktop
                 # resuming an old session) first told us about the session.
-                rec["updated_at"] = ts
+                rec["updated_at"] = rec["since"] = ts
             else:
                 rec["updated_at"] = max(rec.get("updated_at", 0), ts)
         if rec.get("state") is None:
             rec["state"] = "idle"
-            rec["updated_at"] = int(mtime or now)
+            rec["updated_at"] = rec["since"] = int(mtime or now)
+        rec.setdefault("since", rec.get("updated_at", 0))  # records from before "since"
+        # A terminal session whose process is gone has ended, even without the
+        # end-of-session hook (say, the terminal window was closed).
+        if agent and not rec.get("hidden") and color_of(rec) != "read" and agent.alive(rec) is False:
+            rec["hidden"] = True
         # You looked at it in the app after it finished.
-        x = facts.get(key, {})
         if rec["state"] == "done" and not rec.get("seen"):
             if x.get("focused", 0) >= rec.get("updated_at", 0) or x.get("read"):
                 rec["seen"], rec["seen_at"] = True, int(now)
@@ -901,6 +1123,7 @@ def cmd_open(key):
     jump = rec.get("jump") or {}
     agent = AGENTS.get(rec.get("tool"))
     default = agent.bundle if agent else CLAUDE_BUNDLE
+    debug_log("open", {"key": key, "state": rec.get("state"), "jump": jump})
     if jump.get("kind") == "url":
         # The deep link switches the app to the session; then bring the app forward.
         subprocess.call(["/usr/bin/open", jump["target"]])
@@ -924,7 +1147,9 @@ def cmd_status():
     """The sessions to show and how many of each kind. The menu bar app reads this."""
     with Lock():
         records = [r for r in collect() if color_of(r) in KINDS]
-    records.sort(key=lambda r: -r.get("updated_at", 0))
+    # Newest first by when each entered its state, not by its last event, so running
+    # sessions keep their place while they work.
+    records.sort(key=lambda r: -(r.get("since") or r.get("updated_at", 0)))
     out = {"counts": {k: 0 for k in KINDS}, "sessions": []}
     for r in records:
         kind = color_of(r)
@@ -936,7 +1161,7 @@ def cmd_status():
             "bundle": agent.bundle if agent else "",
             "reason": r.get("reason") or "", "detail": r.get("detail") or "",
             "name": r.get("name") or r.get("title") or r.get("tool") or "",
-            "cwd": r.get("cwd") or "", "updated_at": r.get("updated_at") or 0,
+            "cwd": r.get("cwd") or "", "updated_at": r.get("since") or r.get("updated_at") or 0,
             "prompt": r.get("prompt") or "",
         })
     print(json.dumps(out, ensure_ascii=False))

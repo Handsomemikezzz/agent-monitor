@@ -77,7 +77,15 @@ Antigravity hooks ─┘   (适配器把事件翻译成通用事件，          
 |---|---|---|
 | 对话记录末尾（Claude：`~/.claude/projects/*/<id>.jsonl`；Codex：`rollout-*.jsonl`，路径来自 hook 的 `transcript_path` 或 Codex 数据库） | 最后一轮的结果：结束（`stop_reason: end_turn`、`stop_hook_summary` / `task_complete`）、中断（`[Request interrupted by user` / `turn_aborted`）、还在跑 | 对话记录比最近一次 hook 新（多于 2 秒）时，以对话记录为准。审批和提问只认 hook |
 | Claude Desktop 的会话文件 `~/Library/Application Support/Claude/claude-code-sessions/*/*/local_*.json` | `cliSessionId`、`title`、`isArchived`、`lastFocusedAt` | 发现会话、显示真实标题、隐藏归档；完成后又点开过（`lastFocusedAt` ≥ 完成时间）算已读 |
+| Claude Desktop 的 Local Storage（`Local Storage/leveldb` 里的 `epitaxy-unread-v1`） | 侧边栏的未读标记 `unreadIds` | 我们没看着它完成的会话（重新打开的旧对话、扫描发现的会话），以 Desktop 自己的未读标记为准 |
+| Claude Code 的会话登记 `~/.claude/sessions/<pid>.json` | 每个运行中进程的 `sessionId` 和 `pid`，进程在文件就在 | 终端会话的进程没了就算结束（隐藏），即使没收到 `SessionEnd` |
 | Codex 数据库 `~/.codex/state_*.sqlite`（只读） | `threads` 的标题、`archived`、`originator`；`thread_read_receipts.first_unread_turn` | 发现会话、显示标题、隐藏归档；`originator = Codex Desktop` 时生成 `codex://threads/<id>`；未读标记直接用 App 自己的 |
+
+一轮结束算不算未读：只有我们看着这一轮在跑（之前是运行中或等你处理），或者 App 自己把它标成未读，才算未读。只从对话记录里发现的结束（比如在 Desktop 里重新打开一个旧对话，它会发 `SessionStart(resume)`），默认已读。
+
+Codex 的终端会话：hook 触发时记下执行它的 `codex` 进程（pid 和启动时间），进程不在了就算结束。
+
+面板按每个会话进入当前状态的时间排序（`since`），而不是最近一次事件的时间。运行中的会话每次调用工具都会更新，按事件时间排的话，它在列表里会不停换位置，点击时鼠标下面的那一行可能已经换了，点了没反应。
 
 另外，Stop 触发时如果 Claude Desktop 在最前面，而且这个会话是最近一次点开的那个（也就是你正看着它完成），直接记为已读。
 
@@ -199,8 +207,8 @@ agent-status/
 ## 8. 已知限制
 
 - Claude 里按 Esc 中断、拒绝审批都不发 hook，要等下次刷新读到对话记录才从徽标上消失，最多 30 秒（打开面板时会立即刷新）。
-- 没有超时判断，所以如果终端里的 agent 在一轮中途被强制杀掉、没来得及发 `SessionEnd`，这个会话会一直显示运行中，直到它下一次有事件。
+- 终端会话的进程没了会自动结束，目前支持 Claude Code 和 Codex；Antigravity CLI 还不行。
 - 如果你一直看着某个 Desktop 会话、但 Desktop 不在最前面时它完成了，会记成未读，直到你切走再切回来、在面板里点它或发下一条消息。
-- Desktop 会话文件、对话记录格式、Codex 数据库表结构都是应用内部的东西，升级后可能变化。读不到时只是少了校正，hook 那部分照常工作。
+- Desktop 会话文件和未读标记、Claude Code 的会话登记、对话记录格式、Codex 数据库表结构都是应用内部的东西，升级后可能变化。读不到时只是少了校正，hook 那部分照常工作。
 - App 是本机编译、ad-hoc 签名的，不经过公证，所以只能用 `install.sh` 在本机构建，不能直接分发 .app。
 - 深链接属于两个应用的内部接口，没有公开文档，升级后可能失效。所以 `agent-status open` 在链接打不开时，至少要把对应应用切到前台。

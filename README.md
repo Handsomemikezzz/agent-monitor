@@ -81,7 +81,9 @@ To uninstall:
 | Turn finished | `Stop` | `Stop` | `Stop` | 🔵 Unread |
 | Interrupted | transcript | `Interrupt` | transcript | hidden |
 
-There are no timeouts. A session keeps its state until the session itself changes, so a long task stays **Running** and an unread result stays **Unread**. An unread session clears when you open it in the panel or in the app, or send it a new message. If the Claude or Codex app quits during a turn, that turn ends.
+There are no timeouts. A session keeps its state until the session itself changes, so a long task stays **Running** and an unread result stays **Unread**. An unread session clears when you open it in the panel or in the app, or send it a new message. If the Claude or Codex app quits during a turn, that turn ends. A terminal session ends when its process is gone, even if it never sent its end hook.
+
+A finish counts as unread only if Agent Status saw that turn running, or the app itself marks it unread (Claude Desktop's sidebar, the Codex app). Reopening an old chat doesn't bring it back as unread.
 
 Only sessions you started are shown. Subagents, and the Codex app's internal background sessions, are skipped.
 
@@ -113,6 +115,6 @@ To log every hook event to `~/.agent-status/debug.log`, run `touch ~/.agent-stat
 - Jumping back uses deep links that Claude and Codex don't document. If a link stops working, clicking still brings the app to the front. Antigravity has no link to a single conversation, so clicking brings Antigravity to the front.
 - Antigravity support is experimental: running and finished are tested with real sessions; "needs you" is built from its documentation and hasn't been seen in a real session yet.
 - Changes that don't fire a hook, like Esc in Claude Code, can take up to 30 seconds to show.
-- If an agent is killed without sending its end-of-session hook (for example, a terminal force-quit mid-turn), that session stays **Running** until it sends another event.
-- Transcripts, Claude Desktop's session files, Codex's database and Antigravity's records are internal formats and may change. If they can't be read, the hooks still work.
+- Agent Status can tell when a terminal session's process is gone for Claude Code and Codex, not yet for the Antigravity CLI.
+- Transcripts, Claude Desktop's session files and unread marks, Claude Code's session registry, Codex's database and Antigravity's records are internal formats and may change. If they can't be read, the hooks still work.
 - The app is built and signed on your Mac by `install.sh`. There's no prebuilt download.

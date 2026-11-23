@@ -7,7 +7,10 @@ in a throwaway state folder and checks what it decides.
 import json, os, shutil, subprocess, sys, tempfile, time
 BIN = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "bin", "agent-status")
 D = tempfile.mkdtemp(prefix="agent-status-test-")
-base = dict(os.environ, AGENT_STATUS_DIR=D, CLAUDE_CODE_ENTRYPOINT="cli")
+# A home of our own, so the apps' real files (Claude Desktop, Codex) stay out of it.
+HOME = os.path.join(D, "home")
+os.makedirs(HOME)
+base = dict(os.environ, AGENT_STATUS_DIR=D, CLAUDE_CODE_ENTRYPOINT="cli", HOME=HOME)
 base.pop("CLAUDE_CODE_HOST_SESSION_ID", None)
 os.makedirs(D, exist_ok=True)
 def iso(): return time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime())
@@ -54,9 +57,62 @@ d.hook("UserPromptSubmit", prompt="x"); d.line(END); d.hook("Stop")
 d.check("desktop turn done", "done/-/unseen")
 d.hook("SessionEnd", reason="other"); d.check("app quit keeps it", "done/-/unseen")
 d.hook("SessionStart", source="resume"); d.check("app resumes it", "done/-/unseen")
-# A session we never saw before, resumed after its turn already finished.
+# A session we never saw before, resumed after its turn already finished: an old
+# chat reopened, not news.
 n = S("new-1", base); n.line(END); time.sleep(1)
-n.hook("SessionStart", source="resume"); n.check("unknown session resumed", "done/-/unseen")
+n.hook("SessionStart", source="resume"); n.check("old chat reopened", "done/-/seen")
+
+# Claude Desktop's own unread marks decide for chats whose finish we didn't watch.
+def desktop_session(cli_id, desk_id):
+    p = os.path.join(HOME, "Library/Application Support/Claude/claude-code-sessions/a/b")
+    os.makedirs(p, exist_ok=True)
+    now_ms = int(time.time() * 1000)
+    json.dump({"sessionId": desk_id, "cliSessionId": cli_id, "cwd": "/tmp/p", "title": cli_id,
+               "lastActivityAt": now_ms, "lastFocusedAt": now_ms - 3600 * 1000, "isArchived": False},
+              open(os.path.join(p, desk_id + ".json"), "w"))
+def desktop_unread(ids):
+    """Writes Desktop's Local Storage the way Chromium does: one LevelDB log record."""
+    def varint(n):
+        out = b""
+        while n >= 0x80: out += bytes([n & 0x7F | 0x80]); n >>= 7
+        return out + bytes([n])
+    key = b"_https://claude.ai\x00\x01epitaxy-unread-v1"
+    val = b"\x01" + json.dumps({"state": {"unreadIds": ids, "explicitUnreadIds": [], "stoppedRuns": []},
+                                "version": 0}).encode()
+    batch = (1).to_bytes(8, "little") + (1).to_bytes(4, "little") + b"\x01" + varint(len(key)) + key + varint(len(val)) + val
+    p = os.path.join(HOME, "Library/Application Support/Claude/Local Storage/leveldb")
+    os.makedirs(p, exist_ok=True)
+    open(os.path.join(p, "000003.log"), "wb").write(b"\0\0\0\0" + len(batch).to_bytes(2, "little") + b"\x01" + batch)
+desktop_unread(["local_dd-unread"])
+desk = dict(base, CLAUDE_CODE_ENTRYPOINT="claude-desktop")
+for sid, want in (("dd-unread", "done/-/unseen"), ("dd-read", "done/-/seen")):
+    desktop_session(sid, "local_" + sid)
+    s = S(sid, dict(desk, CLAUDE_CODE_HOST_SESSION_ID="local_" + sid)); s.line(END); time.sleep(1)
+    s.hook("SessionStart", source="resume")
+    s.check("old Desktop chat, Desktop says %s" % want.split("/")[-1], want)
+
+# A terminal session whose process is gone has ended, even with no end hook.
+REG = os.path.join(HOME, ".claude/sessions")
+os.makedirs(REG)
+proc = subprocess.Popen(["/bin/sleep", "60"])
+json.dump({"pid": proc.pid, "sessionId": "cli-dead-1"}, open(os.path.join(REG, "%d.json" % proc.pid), "w"))
+k = S("cli-dead-1", base)
+k.hook("UserPromptSubmit", prompt="x"); k.hook("Stop"); k.check("terminal session alive", "done/-/unseen")
+proc.kill(); proc.wait(); os.remove(os.path.join(REG, "%d.json" % proc.pid))
+k.check("terminal closed, no end hook", "hidden")
+
+# Running sessions keep their place in the panel while they work.
+def order():
+    out = json.loads(subprocess.run([BIN, "status"], capture_output=True, text=True, env=base).stdout)
+    return [x["key"] for x in out["sessions"] if x["key"] in ("claude-ord-1", "claude-ord-2")]
+o1 = S("ord-1", base); o1.hook("UserPromptSubmit", prompt="a"); time.sleep(1.1)
+o2 = S("ord-2", base); o2.hook("UserPromptSubmit", prompt="b"); time.sleep(1.1)
+before = order(); time.sleep(2.5)
+o1.line({"type": "assistant", "message": {"stop_reason": "tool_use", "content": []}}); o1.hook("PostToolUse", tool_name="Bash")
+after = order()
+ok = before == after == ["claude-ord-2", "claude-ord-1"]
+print("ok  " if ok else "FAIL", "running sessions keep their order", after)
+if not ok: FAILED.append("order")
 # No timers: a long-running turn stays running, and an unread finish stays unread.
 def age(sess, hours):
     p = os.path.join(D, "claude-%s.json" % sess.sid)
@@ -83,6 +139,22 @@ i.check("codex app internal session", "hidden")
 g = S("codex-sub-1", base, tool="codex", meta={"thread_source": "subagent", "source": {"subagent": {"thread_spawn": {}}}})
 g.hook("UserPromptSubmit", prompt="explore"); g.line(TASK_DONE); g.hook("Stop")
 g.check("codex subagent thread", "hidden")
+# A Codex terminal session lives as long as the codex process that runs its hooks.
+FAKE = os.path.join(D, "codex-fake")
+os.symlink("/bin/sh", FAKE)
+t = S("codex-term-1", base, tool="codex", meta={"thread_source": "user", "source": "cli"})
+t.line(TASK_DONE)
+for ev in ("UserPromptSubmit", "Stop"):
+    open(os.path.join(D, ev), "w").write(json.dumps(dict(hook_event_name=ev, session_id=t.sid, cwd="/tmp/p",
+                                                         transcript_path=t.tr, prompt="x")))
+run = "'%s' hook codex < '%s'/UserPromptSubmit; '%s' hook codex < '%s'/Stop; sleep 60" % (BIN, D, BIN, D)
+codex = subprocess.Popen([FAKE, "-c", run], env=base)
+for _ in range(50):
+    if t.state() == "done/-/unseen": break
+    time.sleep(.2)
+t.check("codex in a terminal", "done/-/unseen")
+codex.kill(); codex.wait()
+t.check("codex terminal closed, no end hook", "hidden")
 
 # Antigravity: camelCase payloads, the event name on the command line, no prompt event.
 class Agy(S):
