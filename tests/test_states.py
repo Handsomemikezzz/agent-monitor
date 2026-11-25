@@ -11,7 +11,9 @@ D = tempfile.mkdtemp(prefix="agent-status-test-")
 HOME = os.path.join(D, "home")
 os.makedirs(HOME)
 base = dict(os.environ, AGENT_STATUS_DIR=D, CLAUDE_CODE_ENTRYPOINT="cli", HOME=HOME)
-base.pop("CLAUDE_CODE_HOST_SESSION_ID", None)
+for _k in ("CLAUDE_CODE_HOST_SESSION_ID", "T3CODE_THREAD_ID", "T3_ACP_MCP_NODE",
+           "T3_ACP_MCP_ENDPOINT", "T3_ACP_MCP_AUTHORIZATION", "__CFBundleIdentifier"):
+    base.pop(_k, None)
 os.makedirs(D, exist_ok=True)
 def iso(): return time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime())
 class S:
@@ -186,6 +188,103 @@ a.check("transcript: a step waits for approval", "waiting/permission/seen")
 time.sleep(3)
 a.step(type="PLANNER_RESPONSE", status="DONE", content="done")
 a.check("transcript: reply with no tool calls", "done/-/unseen")
+
+# 1. Hook waiting stays waiting even if transcript flushes assistant tool_use >2s later.
+w = S("wait-keep-1", base)
+w.hook("UserPromptSubmit", prompt="run"); w.hook("PermissionRequest", tool_name="Bash")
+time.sleep(3); w.line({"type": "assistant", "message": {"stop_reason": "tool_use", "content": []}})
+w.check("waiting stays waiting over assistant tool_use", "waiting/permission/seen")
+
+# 2. Antigravity IDE gets its own bundle/jump, accepts WAITING within 2s, and skips T3 ACP.
+ide_env = dict(base, __CFBundleIdentifier="com.google.antigravity-ide")
+ide = S("agy-ide-1", ide_env, tool="antigravity")
+subprocess.run([BIN, "hook", "antigravity", "PreInvocation"],
+               input=json.dumps(dict(conversationId=ide.sid, workspacePaths=["/tmp/p"], transcriptPath=ide.tr,
+                                     invocationNum=0, lastUserInput="fix")),
+               text=True, env=ide_env, capture_output=True)
+ide.line(dict(type="RUN_COMMAND", status="WAITING", created_at=iso()))
+ide.check("antigravity WAITING within 2s", "waiting/permission/seen")
+ide_st = json.loads(subprocess.run([BIN, "status"], capture_output=True, text=True, env=base).stdout)
+ide_row = [x for x in ide_st["sessions"] if x["key"] == "antigravity-agy-ide-1"][0]
+ide_rec = [r for r in json.loads(subprocess.run([BIN, "dump"], capture_output=True, text=True, env=base).stdout)
+           if r["session_id"] == ide.sid][0]
+ok = ide_row["bundle"] == "com.google.antigravity-ide" and ide_rec["jump"]["target"] == "com.google.antigravity-ide"
+print("ok  " if ok else "FAIL", "antigravity IDE jump & bundle", ide_row["bundle"], ide_rec["jump"])
+if not ok: FAILED.append("antigravity-ide-jump")
+
+acp_tr = os.path.join(HOME, ".t3/userdata/providers/antigravity/x/antigravity-acp/brain/acp-1/transcript_full.jsonl")
+os.makedirs(os.path.dirname(acp_tr), exist_ok=True)
+subprocess.run([BIN, "hook", "antigravity", "PreInvocation"],
+               input=json.dumps(dict(conversationId="acp-1", workspacePaths=["/tmp/p"], transcriptPath=acp_tr,
+                                     invocationNum=0, lastUserInput="hi")),
+               text=True, env=base, capture_output=True)
+acp_found = any(r["session_id"] == "acp-1" for r in json.loads(subprocess.run([BIN, "dump"], capture_output=True, text=True, env=base).stdout))
+print("ok  " if not acp_found else "FAIL", "antigravity ignores T3 ACP", acp_found)
+if acp_found: FAILED.append("antigravity-acp-skip")
+
+# 3. T3 Code threads from statev2.sqlite: running, waiting, unread, read, subagent, deep link.
+import sqlite3
+t3_dir = os.path.join(HOME, ".t3/userdata")
+os.makedirs(t3_dir, exist_ok=True)
+open(os.path.join(t3_dir, "environment-id"), "w").write("env-test-1\n")
+t3_con = sqlite3.connect(os.path.join(t3_dir, "statev2.sqlite"))
+t3_con.executescript("""
+CREATE TABLE projection_projects (project_id TEXT PRIMARY KEY, title TEXT, workspace_root TEXT);
+CREATE TABLE orchestration_v2_projection_threads (
+  thread_id TEXT PRIMARY KEY, project_id TEXT, title TEXT, default_provider TEXT,
+  runtime_mode TEXT, interaction_mode TEXT, active_provider_thread_id TEXT,
+  created_at TEXT, updated_at TEXT, archived_at TEXT, deleted_at TEXT, payload_json TEXT, provider_instance_id TEXT);
+CREATE TABLE orchestration_v2_projection_runs (
+  run_id TEXT PRIMARY KEY, thread_id TEXT, ordinal INTEGER, provider TEXT,
+  provider_thread_id TEXT, status TEXT, requested_at TEXT, completed_at TEXT, payload_json TEXT, provider_instance_id TEXT);
+CREATE TABLE orchestration_v2_projection_runtime_requests (
+  runtime_request_id TEXT PRIMARY KEY, thread_id TEXT, node_id TEXT, provider_turn_id TEXT,
+  kind TEXT, status TEXT, created_at TEXT, resolved_at TEXT, payload_json TEXT);
+CREATE TABLE orchestration_v2_projection_messages (
+  message_id TEXT PRIMARY KEY, thread_id TEXT, run_id TEXT, node_id TEXT,
+  role TEXT, is_streaming INTEGER, created_at TEXT, updated_at TEXT, payload_json TEXT);
+""")
+t_now = time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime())
+t_old = time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime(time.time() - 60))
+t3_con.execute("INSERT INTO projection_projects VALUES ('p1', 'proj', '/tmp/proj')")
+t3_con.execute("INSERT INTO orchestration_v2_projection_threads VALUES ('t-run', 'p1', 'Running Task', 'antigravity', 'full-access', 'default', '', ?, ?, NULL, NULL, ?, 'antigravity')",
+               (t_old, t_now, json.dumps({"lastVisitedAt": t_old})))
+t3_con.execute("INSERT INTO orchestration_v2_projection_runs VALUES ('r1', 't-run', 1, 'antigravity', '', 'running', ?, NULL, '{}', 'antigravity')", (t_now,))
+t3_con.execute("INSERT INTO orchestration_v2_projection_messages VALUES ('m1', 't-run', 'r1', 'n1', 'user', 0, ?, ?, ?)", (t_now, t_now, json.dumps({"text": "fix bug"})))
+
+t3_con.execute("INSERT INTO orchestration_v2_projection_threads VALUES ('t-wait', 'p1', 'Question Task', 'codex', 'full-access', 'default', '', ?, ?, NULL, NULL, ?, 'codex')",
+               (t_old, t_now, json.dumps({"lastVisitedAt": t_old})))
+t3_con.execute("INSERT INTO orchestration_v2_projection_runs VALUES ('r2', 't-wait', 1, 'codex', '', 'running', ?, NULL, '{}', 'codex')", (t_now,))
+t3_con.execute("INSERT INTO orchestration_v2_projection_runtime_requests VALUES ('req1', 't-wait', 'n2', 'pt1', 'user_input', 'pending', ?, NULL, '{}')", (t_now,))
+
+t3_con.execute("INSERT INTO orchestration_v2_projection_threads VALUES ('t-done', 'p1', 'Done Task', 'claudeAgent', 'full-access', 'default', '', ?, ?, NULL, NULL, ?, 'claudeAgent')",
+               (t_old, t_now, json.dumps({"lastVisitedAt": t_old})))
+t3_con.execute("INSERT INTO orchestration_v2_projection_runs VALUES ('r3', 't-done', 1, 'claudeAgent', '', 'completed', ?, ?, '{}', 'claudeAgent')", (t_old, t_now))
+
+t3_con.execute("INSERT INTO orchestration_v2_projection_threads VALUES ('t-sub', 'p1', 'Subagent', 'antigravity', 'full-access', 'default', '', ?, ?, NULL, NULL, ?, 'antigravity')",
+               (t_old, t_now, json.dumps({"lineage": {"relationshipToParent": "subagent"}})))
+t3_con.execute("INSERT INTO orchestration_v2_projection_runs VALUES ('r4', 't-sub', 1, 'antigravity', '', 'running', ?, NULL, '{}', 'antigravity')", (t_now,))
+t3_con.commit()
+
+dump = {r["session_id"]: r for r in json.loads(subprocess.run([BIN, "dump"], capture_output=True, text=True, env=base).stdout)}
+for sid, want in [("t-run", ("running", True)), ("t-wait", ("waiting", True)), ("t-done", ("done", False))]:
+    r = dump.get(sid)
+    ok = r is not None and r["state"] == want[0] and r["seen"] == want[1] and r["jump"]["target"] == "t3code://threads/env-test-1/" + sid
+    print("ok  " if ok else "FAIL", "t3code " + sid, r and (r["state"], r["seen"], r["jump"]))
+    if not ok: FAILED.append("t3-" + sid)
+if "t-sub" in dump and not dump["t-sub"].get("hidden"):
+    print("FAIL t3code subagent visible"); FAILED.append("t3-sub")
+else:
+    print("ok   t3code subagent hidden")
+
+# Visiting t-done in T3 Code clears unread.
+t_visit = time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime(time.time() + 5))
+t3_con.execute("UPDATE orchestration_v2_projection_threads SET payload_json = ? WHERE thread_id = 't-done'", (json.dumps({"lastVisitedAt": t_visit}),))
+t3_con.commit(); t3_con.close()
+dump2 = {r["session_id"]: r for r in json.loads(subprocess.run([BIN, "dump"], capture_output=True, text=True, env=base).stdout)}
+ok = dump2["t-done"]["seen"] is True
+print("ok  " if ok else "FAIL", "t3code visited clears unread", dump2["t-done"]["seen"])
+if not ok: FAILED.append("t3-visit")
 
 shutil.rmtree(D, ignore_errors=True)
 print("%d failed" % len(FAILED) if FAILED else "all passed")

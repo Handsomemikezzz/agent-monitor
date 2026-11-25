@@ -148,6 +148,8 @@ final class Store: ObservableObject {
     let bin: String
     let stateDir: String
     private var watcher: DispatchSourceFileSystemObject?
+    private var t3Watcher: DispatchSourceFileSystemObject?
+    private var t3Debouncer: DispatchWorkItem?
     private var timer: Timer?
     private var loading = false
     private var again = false
@@ -159,6 +161,7 @@ final class Store: ObservableObject {
         bin = env["AGENT_STATUS_BIN"] ?? root.appendingPathComponent("bin/agent-status").path
         stateDir = env["AGENT_STATUS_DIR"] ?? (NSHomeDirectory() + "/.agent-status")
         watch()
+        watchT3()
         // Hooks cover most changes the moment they happen (see watch()). This timer only
         // catches the few that send no hook, such as Esc in Claude Code or reading a
         // session in the app, so it runs only while there's a session on the badge.
@@ -182,6 +185,40 @@ final class Store: ObservableObject {
         watcher = src
     }
 
+    /// T3 Code writes its state to SQLite WAL instead of hooks; watch it with a short debounce.
+    private func watchT3() {
+        t3Watcher?.cancel()
+        t3Watcher = nil
+        let dir = NSHomeDirectory() + "/.t3/userdata"
+        let wal = dir + "/statev2.sqlite-wal"
+        let watchingWal = FileManager.default.fileExists(atPath: wal)
+        let path = watchingWal ? wal : dir
+        let fd = open(path, O_EVTONLY)
+        guard fd >= 0 else { return }
+        let mask: DispatchSource.FileSystemEvent = watchingWal
+            ? [.write, .extend, .rename, .delete]
+            : [.write, .rename, .delete]
+        let src = DispatchSource.makeFileSystemObjectSource(fileDescriptor: fd, eventMask: mask, queue: .main)
+        src.setEventHandler { [weak self, weak src] in
+            guard let self = self else { return }
+            self.scheduleReload()
+            let flags = src?.data ?? []
+            if !watchingWal || flags.contains(.delete) || flags.contains(.rename) {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in self?.watchT3() }
+            }
+        }
+        src.setCancelHandler { close(fd) }
+        src.resume()
+        t3Watcher = src
+    }
+
+    private func scheduleReload() {
+        t3Debouncer?.cancel()
+        let item = DispatchWorkItem { [weak self] in self?.reload() }
+        t3Debouncer = item
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.25, execute: item)
+    }
+
     /// Runs `agent-status status`. Calls that arrive while one is running are folded into one more run.
     func reload() {
         if loading { again = true; return }
@@ -201,7 +238,8 @@ final class Store: ObservableObject {
     }
 
     func perform(_ args: [String], then: (() -> Void)? = nil) {
-        work.async { [self] in
+        let q = args.first == "open" ? DispatchQueue.global(qos: .userInitiated) : work
+        q.async { [self] in
             _ = run(args)
             DispatchQueue.main.async { self.reload(); then?() }
         }

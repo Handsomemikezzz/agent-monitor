@@ -36,9 +36,12 @@ HOOK_MARKER = "agent-status\" hook"  # how our hook commands are recognised on u
 RECENT = 24 * 3600
 
 CODEX_HOME = os.environ.get("CODEX_HOME", "~/.codex")
+T3_USERDATA = os.environ.get("T3_USERDATA", "~/.t3/userdata")
 
 CLAUDE_BUNDLE = "com.anthropic.claudefordesktop"
 CODEX_BUNDLE = "com.openai.codex"
+T3_BUNDLE = "com.t3tools.t3code"
+ANTIGRAVITY_BUNDLES = ("com.google.antigravity", "com.google.antigravity-ide")
 
 ASK_TOOLS = {"AskUserQuestion", "ExitPlanMode"}
 WAIT_NOTIFICATIONS = {
@@ -463,6 +466,11 @@ def _terminal_or(bundle):
     return {"kind": "app", "target": term or bundle}
 
 
+def _t3_env():
+    """True when a hook is running inside a T3 Code managed agent thread."""
+    return "T3CODE_THREAD_ID" in os.environ or "T3_ACP_MCP_NODE" in os.environ
+
+
 # ---------------------------------------------------------------- agents
 #
 # One adapter per agent. Each says how to install its hooks, how to read its hook
@@ -631,6 +639,8 @@ class Claude(Agent):
     ]
 
     def translate(self, event, data):
+        if _t3_env():
+            return None
         return _claude_style_event(event, data, ASK_TOOLS)
 
     def jump(self, sid, data):
@@ -740,7 +750,10 @@ class Claude(Agent):
                 rec["hidden"] = True
             facts[key] = {"focused": (d.get("lastFocusedAt") or 0) / 1000}
             if unread is not None:
-                facts[key]["unread"] = d["sessionId"] in unread
+                in_unread = d["sessionId"] in unread
+                facts[key]["unread"] = in_unread
+                if not in_unread and now - rec.get("updated_at", 0) > 5:
+                    facts[key]["read"] = True
 
     def on_screen(self, rec):
         """The Desktop session you were looking at when it finished."""
@@ -767,10 +780,10 @@ class Codex(Agent):
     ]
 
     def translate(self, event, data):
-        if not data.get("transcript_path"):
+        if _t3_env() or not data.get("transcript_path"):
             # The Codex app runs short internal sessions of its own (summaries, safety
             # review) that fire hooks too. They have no transcript and no thread you
-            # could open, so they aren't yours to track.
+            # could open, so they aren't yours to track. T3 Code tracks its own threads.
             return None
         return _claude_style_event(event, data)
 
@@ -837,7 +850,7 @@ class Codex(Agent):
         for tid, rollout, cwd, title, archived, originator, source, unread in rows:
             key = "codex-" + _safe(tid)
             if key not in recs:
-                if archived or source != "user" or originator == "codex_exec":
+                if archived or source != "user" or originator != "Codex Desktop":
                     continue
                 recs[key] = _new_record("codex", tid, cwd)
             rec = recs[key]
@@ -894,6 +907,8 @@ class Antigravity(Agent):
         sid = data.get("conversationId") or os.environ.get("ANTIGRAVITY_CONVERSATION_ID") or ""
         roots = data.get("workspacePaths") or []
         path = data.get("transcriptPath") or ""
+        if _t3_env() or "/antigravity-acp/" in path or "/.t3/userdata/providers/" in path:
+            return None
         ev = {"sid": sid, "cwd": data.get("cwd") or (roots[0] if roots else ""),
               "transcript": os.path.expanduser(path) if path else ""}
         tool = (data.get("toolCall") or {}).get("name", "")
@@ -914,12 +929,17 @@ class Antigravity(Agent):
         return ev
 
     def jump(self, sid, data):
-        # No documented link to a single conversation: bring the app (or, for the
-        # CLI, its terminal) forward.
+        # No documented link to a single conversation: bring the app (Antigravity or
+        # Antigravity IDE) or, for the CLI, its terminal forward.
         path = data.get("transcriptPath") or ""
         if "antigravity-cli" in path:
             return _terminal_or(self.bundle)
-        return {"kind": "app", "target": self.bundle}
+        app = os.environ.get("__CFBundleIdentifier")
+        return {"kind": "app", "target": app if app in ANTIGRAVITY_BUNDLES else self.bundle}
+
+    def process(self):
+        app = os.environ.get("__CFBundleIdentifier")
+        return {"bundle": app} if app in ANTIGRAVITY_BUNDLES else None
 
     @staticmethod
     def app_dir(rec):
@@ -990,7 +1010,8 @@ class Antigravity(Agent):
     def on_screen(self, rec):
         """The conversation you were looking at in Antigravity when it finished."""
         d = self.app_dir(rec)
-        if not d or _frontmost() != self.bundle:
+        bundle = rec.get("bundle") or (rec.get("jump") or {}).get("target") or self.bundle
+        if not d or _frontmost() != bundle:
             return False
         views = {os.path.basename(f)[:-len(".pbtxt")]: 0
                  for f in glob.glob(os.path.join(d, "annotations", "*.pbtxt"))}
@@ -1028,7 +1049,168 @@ class Antigravity(Agent):
             _edit_json(path, lambda data: data.pop(self.HOOK_NAME, None))
 
 
-AGENTS = {a.name: a for a in (Claude(), Codex(), Antigravity())}
+class T3Code(Agent):
+    """T3 Code desktop app. Reads its SQLite projection directly so every provider
+    (Antigravity ACP, Codex, Claude) is tracked without duplicate rows and jumps
+    straight to the thread via t3code://threads/<env>/<thread>."""
+    name, label, bundle = "t3code", "T3 Code", T3_BUNDLE
+
+    def translate(self, event, data):
+        return None
+
+    def present(self):
+        return (os.path.isdir(os.path.expanduser(T3_USERDATA))
+                or os.path.isdir("/Applications/T3 Code (Beta).app"))
+
+    @staticmethod
+    def _env_id():
+        try:
+            with open(os.path.join(os.path.expanduser(T3_USERDATA), "environment-id")) as f:
+                return f.read().strip()
+        except OSError:
+            return ""
+
+    def scan(self, recs, now, facts):
+        db = os.path.join(os.path.expanduser(T3_USERDATA), "statev2.sqlite")
+        if not os.path.exists(db):
+            return
+        threads = _sqlite_rows(
+            db,
+            "SELECT thread_id, project_id, title, updated_at, archived_at, payload_json"
+            " FROM orchestration_v2_projection_threads WHERE deleted_at IS NULL",
+            (),
+        )
+        if not threads:
+            for k, r in recs.items():
+                if r.get("tool") == self.name:
+                    r["hidden"] = True
+            return
+
+        env_id = self._env_id()
+        projects = dict(_sqlite_rows(db, "SELECT project_id, workspace_root FROM projection_projects", ()))
+        runs = {}
+        for tid, status, req_at, comp_at in _sqlite_rows(
+            db,
+            "SELECT r.thread_id, r.status, r.requested_at, r.completed_at"
+            " FROM orchestration_v2_projection_runs r"
+            " JOIN (SELECT thread_id, MAX(ordinal) AS max_ord FROM orchestration_v2_projection_runs GROUP BY thread_id) m"
+            " ON r.thread_id = m.thread_id AND r.ordinal = m.max_ord",
+            (),
+        ):
+            runs[tid] = (status, req_at, comp_at)
+
+        pending = {}
+        for tid, kind, created_at in _sqlite_rows(
+            db,
+            "SELECT thread_id, kind, created_at FROM orchestration_v2_projection_runtime_requests"
+            " WHERE status IN ('pending', 'waiting') AND resolved_at IS NULL"
+            " ORDER BY (kind = 'user_input') DESC, created_at DESC",
+            (),
+        ):
+            pending.setdefault(tid, (kind, created_at))
+
+        prompts = {}
+        for tid, pj in _sqlite_rows(
+            db,
+            "SELECT thread_id, payload_json FROM orchestration_v2_projection_messages"
+            " WHERE role = 'user' ORDER BY created_at DESC LIMIT 200",
+            (),
+        ):
+            if tid in prompts:
+                continue
+            try:
+                prompts[tid] = _first_line(json.loads(pj).get("text"))
+            except ValueError:
+                pass
+
+        parsed = []
+        max_visited_tid, max_visited_ts = None, 0
+        seen_tids = set()
+        for tid, pid, title, updated_at, archived_at, pj in threads:
+            seen_tids.add(tid)
+            try:
+                payload = json.loads(pj) if pj else {}
+            except ValueError:
+                payload = {}
+            lv = _iso(payload.get("lastVisitedAt") or "")
+            if not archived_at and lv > max_visited_ts:
+                max_visited_tid, max_visited_ts = tid, lv
+            parsed.append((tid, pid, title, updated_at, archived_at, payload, lv))
+
+        front_t3 = _frontmost() == self.bundle
+
+        for k, r in recs.items():
+            if r.get("tool") == self.name and r.get("session_id") not in seen_tids:
+                r["hidden"] = True
+
+        for tid, pid, title, updated_at, archived_at, payload, last_visited in parsed:
+            key = "t3code-" + _safe(tid)
+            if archived_at or (payload.get("lineage") or {}).get("relationshipToParent") == "subagent":
+                if key in recs:
+                    recs[key]["hidden"] = True
+                continue
+
+            updated_ts = _iso(updated_at)
+            if tid in pending:
+                req_kind, req_ts = pending[tid]
+                state = "waiting"
+                reason = ("question" if req_kind == "user_input"
+                          else "plan" if "plan" in (req_kind or "").lower()
+                          else "permission")
+                ts = _iso(req_ts) or updated_ts
+            elif tid in runs:
+                run_status, req_at, comp_at = runs[tid]
+                if run_status in ("preparing", "queued", "starting", "running", "waiting"):
+                    state, reason, ts = "running", "", _iso(req_at) or updated_ts
+                elif run_status in ("completed", "failed"):
+                    state, reason, ts = "done", "", _iso(comp_at or req_at) or updated_ts
+                elif run_status in ("cancelled", "interrupted"):
+                    state, reason, ts = "idle", "interrupted", _iso(comp_at or req_at) or updated_ts
+                else:
+                    state, reason, ts = "idle", "", updated_ts
+            else:
+                continue
+
+            if key not in recs and state not in ("running", "waiting") and ts < now - RECENT:
+                continue
+
+            cwd = payload.get("worktreePath") or projects.get(pid) or ""
+            rec = recs.get(key)
+            if rec is None:
+                rec = recs[key] = _new_record(self.name, tid, cwd)
+            rec.pop("hidden", None)
+            rec["cwd"] = cwd
+            rec["title"] = os.path.basename(cwd.rstrip("/")) or self.label
+            if title:
+                rec["name"] = title.strip().splitlines()[0]
+            if prompts.get(tid):
+                rec["prompt"] = prompts[tid]
+            rec["jump"] = (
+                {"kind": "url", "target": "t3code://threads/%s/%s" % (env_id, tid), "fallback": self.bundle}
+                if env_id else {"kind": "app", "target": self.bundle}
+            )
+
+            settled_at = _iso(payload.get("settledAt") or "")
+            is_read = (payload.get("settledOverride") == "settled"
+                       or max(settled_at, last_visited) >= ts)
+            if state != rec.get("state"):
+                on_screen_now = front_t3 and max_visited_tid == tid
+                rec["seen"] = state != "done" or is_read or on_screen_now
+                rec["state"], rec["reason"] = state, reason
+                rec["since"] = rec["updated_at"] = ts
+                rec.pop("detail", None)
+                if rec["seen"] and state == "done":
+                    rec["seen_at"] = int(now)
+                else:
+                    rec.pop("seen_at", None)
+            else:
+                rec["updated_at"] = max(rec.get("updated_at", 0), ts)
+
+            if rec.get("state") == "done" and not rec.get("seen") and is_read:
+                facts[key] = {"read": True}
+
+
+AGENTS = {a.name: a for a in (Claude(), Codex(), Antigravity(), T3Code())}
 
 
 # ---------------------------------------------------------------- collect
@@ -1050,8 +1232,23 @@ def collect():
         mtime = os.path.getmtime(path) if path and os.path.exists(path) else 0
         turn = agent.turn(path) if agent and mtime else None
         # The transcript wins only when it's newer than the last hook event; the
-        # hook stays the authority on approvals and questions.
-        if turn and (rec.get("state") is None or turn[2] > rec.get("updated_at", 0) + 2):
+        # hook stays the authority on approvals and questions (never downgrade
+        # waiting -> running from a transcript line). For Antigravity, tool
+        # approvals don't fire PreToolUse, so accept a transcript WAITING state
+        # from the current turn even within the 2s hook grace window.
+        allow_turn = False
+        if turn:
+            t_state, _, t_ts = turn
+            updated = rec.get("updated_at", 0)
+            if rec.get("state") is None:
+                allow_turn = True
+            elif rec.get("state") == "waiting" and t_state == "running":
+                allow_turn = False
+            elif rec.get("tool") == "antigravity" and rec.get("state") == "running" and t_state == "waiting" and t_ts >= updated - 2:
+                allow_turn = True
+            elif t_ts > updated + 2:
+                allow_turn = True
+        if allow_turn:
             state, reason, ts = turn
             if state != rec.get("state"):
                 # A finish is news only if we saw that turn running. One we learn about
@@ -1158,7 +1355,7 @@ def cmd_status():
         out["sessions"].append({
             "key": r["_key"], "tool": r.get("tool") or "", "kind": kind,
             "app": agent.label if agent else r.get("tool") or "",
-            "bundle": agent.bundle if agent else "",
+            "bundle": r.get("bundle") or (agent.bundle if agent else ""),
             "reason": r.get("reason") or "", "detail": r.get("detail") or "",
             "name": r.get("name") or r.get("title") or r.get("tool") or "",
             "cwd": r.get("cwd") or "", "updated_at": r.get("since") or r.get("updated_at") or 0,
