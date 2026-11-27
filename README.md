@@ -50,7 +50,7 @@ git clone https://github.com/Handsomemikezzz/agent-monitor.git ~/agent-status
 
 The install script:
 
-1. Adds hooks to `~/.claude/settings.json`, `~/.codex/hooks.json` and `~/.gemini/config/hooks.json`. It backs up each file first and leaves other hooks alone.
+1. Adds hooks to `~/.codex/hooks.json` and `~/.gemini/config/hooks.json`. It backs up each file first and leaves other hooks alone. Claude Code needs no hooks; hooks that older versions added to `~/.claude/settings.json` are removed.
 2. Builds the app into `build/Agent Status.app` and starts it at login with a LaunchAgent.
 3. Asks you to trust the hooks in Codex. Codex only runs hooks you've trusted.
 
@@ -70,20 +70,21 @@ To uninstall:
 
 ## How it works
 
-1. Each agent calls `bin/agent-status hook` on its events. It writes one JSON file per session to `~/.agent-status/`.
+1. Codex and Antigravity call `bin/agent-status hook` on their events. It writes one JSON file per session to `~/.agent-status/`.
 2. The app watches that folder and updates as soon as a file changes.
-3. Some changes don't fire a hook, such as pressing Esc in Claude Code. To catch these, the app also checks session transcripts and the apps' own session records when you open the panel, and every 30 seconds while the badge shows any session. When nothing is shown, it does no periodic work. Each check takes about 0.1 seconds of CPU.
+3. Claude Code keeps its own live state in its session registry (`~/.claude/sessions/<pid>.json`: busy, waiting, idle). The app watches it and takes running / needs you / finished from there; Claude Code has no hooks installed. A terminal session jumps back to the app its process runs in (iTerm, Terminal, VS Code…). Sessions run by T3 Code are left to the T3 Code adapter.
+4. Some changes don't fire a hook, such as pressing Esc in Claude Code. To catch these, the app also checks session transcripts and the apps' own session records when you open the panel, and every 30 seconds while the badge shows any session. When nothing is shown, it does no periodic work. Each check takes about 0.1 seconds of CPU.
 
 | Event | Claude Code | Codex | Antigravity | State |
 |---|---|---|---|---|
-| Working | `UserPromptSubmit` | `UserPromptSubmit` | `PreInvocation` | 🟢 Running |
-| Approval or question | `PermissionRequest`, `PreToolUse`, `Notification` | `PermissionRequest` | `PreToolUse` (ask tools), transcript | 🟡 Needs you |
-| Turn finished | `Stop` | `Stop` | `Stop` | 🔵 Unread |
+| Working | registry `busy` | `UserPromptSubmit` | `PreInvocation` | 🟢 Running |
+| Approval or question | registry `waiting` (plan / question from the transcript) | `PermissionRequest` | `PreToolUse` (ask tools), transcript | 🟡 Needs you |
+| Turn finished | registry `idle` + transcript | `Stop` | `Stop` | 🔵 Unread |
 | Interrupted | transcript | `Interrupt` | transcript | hidden |
 
 There are no timeouts. A session keeps its state until the session itself changes, so a long task stays **Running** and an unread result stays **Unread**. An unread session clears when you open it in the panel or in the app, or send it a new message. If the Claude or Codex app quits during a turn, that turn ends. A terminal session ends when its process is gone, even if it never sent its end hook.
 
-A finish counts as unread only if Agent Status saw that turn running, or the app itself marks it unread (Claude Desktop's sidebar, the Codex app). Reopening an old chat doesn't bring it back as unread.
+A finish counts as unread only if Agent Status saw that turn running, or the app itself marks it unread (Claude Desktop's sidebar, the Codex app). Reopening an old chat doesn't bring it back as unread. When the app marks a chat unread, including **Mark as unread** by hand, it shows here too, however old the chat is.
 
 Only sessions you started are shown. Subagents, and the Codex app's internal background sessions, are skipped.
 
@@ -95,7 +96,7 @@ Everything stays on your Mac, and Agent Status makes no network requests. It onl
 
 - `~/.agent-status/`
 - its LaunchAgent
-- the hook entries in the three settings files above
+- the hook entries in the Codex and Antigravity files above (and, once, removing old ones from `~/.claude/settings.json`)
 - Codex's trust record for those hooks, after you agree
 
 ## Commands
@@ -114,7 +115,7 @@ To log every hook event to `~/.agent-status/debug.log`, run `touch ~/.agent-stat
 
 - Jumping back uses deep links that Claude and Codex don't document. If a link stops working, clicking still brings the app to the front. Antigravity has no link to a single conversation, so clicking brings Antigravity to the front.
 - Antigravity support is experimental: running and finished are tested with real sessions; "needs you" is built from its documentation and hasn't been seen in a real session yet.
-- Changes that don't fire a hook, like Esc in Claude Code, can take up to 30 seconds to show.
+- Changes that don't fire a hook, like an Antigravity interruption, can take up to 30 seconds to show.
 - Agent Status can tell when a terminal session's process is gone for Claude Code and Codex, not yet for the Antigravity CLI.
-- Transcripts, Claude Desktop's session files and unread marks, Claude Code's session registry, Codex's database and Antigravity's records are internal formats and may change. If they can't be read, the hooks still work.
+- Transcripts, Claude Desktop's session files and unread marks, Claude Code's session registry, Codex's database and Antigravity's records are internal formats and may change. For Codex and Antigravity the hooks still work if they can't be read; for Claude Code the registry is the only source.
 - The app is built and signed on your Mac by `install.sh`. There's no prebuilt download.

@@ -103,6 +103,28 @@ k.hook("UserPromptSubmit", prompt="x"); k.hook("Stop"); k.check("terminal sessio
 proc.kill(); proc.wait(); os.remove(os.path.join(REG, "%d.json" % proc.pid))
 k.check("terminal closed, no end hook", "hidden")
 
+# Claude Code's own registry decides running / waiting / turn over, no hooks needed.
+rproc = subprocess.Popen(["/bin/sleep", "60"])
+def registry(sid, status, waiting_for=None):
+    json.dump({"pid": rproc.pid, "sessionId": sid, "cwd": "/tmp/p", "kind": "interactive", "status": status,
+               "waitingFor": waiting_for, "statusUpdatedAt": int(time.time() * 1000)},
+              open(os.path.join(REG, "%d.json" % rproc.pid), "w"))
+r = S("reg-1", base)
+os.makedirs(os.path.join(HOME, ".claude/projects/p"), exist_ok=True)
+os.symlink(r.tr, os.path.join(HOME, ".claude/projects/p/reg-1.jsonl"))
+registry("reg-1", "busy"); r.check("registry: busy, no hooks", "running/-/seen")
+time.sleep(1); registry("reg-1", "waiting", "input needed"); r.check("registry: asks a question", "waiting/question/seen")
+time.sleep(1); registry("reg-1", "waiting", "permission prompt"); r.check("registry: approval", "waiting/permission/seen")
+time.sleep(1); registry("reg-1", "busy"); r.check("registry: answered", "running/-/seen")
+time.sleep(1); r.line(END); registry("reg-1", "idle"); r.check("registry: turn finished", "done/-/unseen")
+time.sleep(1); registry("reg-1", "busy"); r.check("registry: next turn", "running/-/seen")
+time.sleep(1); r.line({"type": "user", "message": {"content": "[Request interrupted by user]"}}); registry("reg-1", "idle")
+r.check("registry: Esc", "idle/interrupted/seen")
+time.sleep(1); registry("reg-1", "busy")
+r.line({"type": "assistant", "message": {"content": [{"type": "tool_use", "name": "ExitPlanMode", "input": {}}]}})
+time.sleep(1); registry("reg-1", "waiting", "permission prompt"); r.check("registry: plan review", "waiting/plan/seen")
+rproc.kill(); rproc.wait(); os.remove(os.path.join(REG, "%d.json" % rproc.pid))
+
 # Running sessions keep their place in the panel while they work.
 def order():
     out = json.loads(subprocess.run([BIN, "status"], capture_output=True, text=True, env=base).stdout)
@@ -285,6 +307,50 @@ dump2 = {r["session_id"]: r for r in json.loads(subprocess.run([BIN, "dump"], ca
 ok = dump2["t-done"]["seen"] is True
 print("ok  " if ok else "FAIL", "t3code visited clears unread", dump2["t-done"]["seen"])
 if not ok: FAILED.append("t3-visit")
+
+# The Codex app's own unread marks (its sidebar dots) decide, "Mark as unread" included.
+import sqlite3
+CX = os.path.join(HOME, ".codex"); os.makedirs(CX, exist_ok=True)
+cx = sqlite3.connect(os.path.join(CX, "state_5.sqlite"))
+cx.execute("CREATE TABLE threads (id TEXT, rollout_path TEXT, cwd TEXT, name TEXT, title TEXT, archived INTEGER,"
+           " originator TEXT, thread_source TEXT, updated_at_ms INTEGER)")
+cx.execute("CREATE TABLE thread_read_receipts (thread_id TEXT, first_unread_turn TEXT)")
+gs = sqlite3.connect(os.path.join(CX, ".codex-global-state.sqlite"))
+gs.execute("CREATE TABLE settings (scope TEXT, key TEXT, value TEXT)")
+def codex_marks(ids):
+    gs.execute("DELETE FROM settings")
+    gs.execute("INSERT INTO settings VALUES ('global', 'electron-thread-read-state-v1', ?)",
+               (json.dumps({"version": 1, "unreadByIdentity": {"me": {"local:abc": ids, "durable:x": ["cx-remote"]}}}),))
+    gs.commit()
+def codex_thread(sess, days_old):
+    cx.execute("INSERT INTO threads VALUES (?, ?, '/tmp/p', ?, '', 0, 'Codex Desktop', 'user', ?)",
+               (sess.sid, sess.tr, sess.sid, int((time.time() - days_old * 86400) * 1000)))
+    cx.commit()
+def codex_state(sid):
+    for r in json.loads(subprocess.run([BIN, "dump"], capture_output=True, text=True, env=base).stdout):
+        if r["session_id"] == sid:
+            return "hidden" if r.get("hidden") else "%s/%s" % (r["state"], "seen" if r.get("seen") else "unseen")
+    return "gone"
+def expect(label, got, want):
+    print("ok  " if got == want else "FAIL", label, got, "" if got == want else "(want %s)" % want)
+    if got != want: FAILED.append(label)
+appenv = dict(base, CODEX_INTERNAL_ORIGINATOR_OVERRIDE="Codex Desktop")
+codex_marks([])
+old = S("cx-old-1", appenv, tool="codex", meta={"thread_source": "user", "source": "vscode"}); old.line(TASK_DONE)
+codex_thread(old, 3)
+expect("old Codex chat, not marked", codex_state(old.sid), "gone")
+codex_marks([old.sid])
+expect("old Codex chat marked unread in the app", codex_state(old.sid), "done/unseen")
+subprocess.run([BIN, "seen-all"], env=base)
+expect("Mark read here sticks while the app's mark stays", codex_state(old.sid), "done/seen")
+codex_marks([]); codex_state(old.sid); codex_marks([old.sid])
+expect("marked unread again in the app", codex_state(old.sid), "done/unseen")
+live = S("cx-live-1", appenv, tool="codex", meta={"thread_source": "user", "source": "vscode"})
+codex_thread(live, 0); live.hook("UserPromptSubmit", prompt="x")
+expect("Codex app thread running", codex_state(live.sid), "running/seen")
+cx.execute("DELETE FROM threads WHERE id = ?", (live.sid,)); cx.commit(); os.remove(live.tr)
+expect("thread deleted in the app", codex_state(live.sid), "gone")
+cx.close(); gs.close()
 
 shutil.rmtree(D, ignore_errors=True)
 print("%d failed" % len(FAILED) if FAILED else "all passed")

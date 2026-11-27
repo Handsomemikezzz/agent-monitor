@@ -39,6 +39,7 @@ CODEX_HOME = os.environ.get("CODEX_HOME", "~/.codex")
 T3_USERDATA = os.environ.get("T3_USERDATA", "~/.t3/userdata")
 
 CLAUDE_BUNDLE = "com.anthropic.claudefordesktop"
+CLAUDE_CLI_BUNDLE = "com.anthropic.claude-code"  # the CLI itself ships as an .app
 CODEX_BUNDLE = "com.openai.codex"
 T3_BUNDLE = "com.t3tools.t3code"
 ANTIGRAVITY_BUNDLES = ("com.google.antigravity", "com.google.antigravity-ide")
@@ -297,14 +298,14 @@ def _frontmost():
     return out.rsplit("=", 1)[-1].strip().strip('"') or None
 
 
-def _sqlite_rows(pattern, query, params):
-    """Rows from the newest read-only SQLite file matching `pattern`, or [] if there's
-    none or its schema isn't what we expect (it's another app's, and may change)."""
+def _sqlite_rows(pattern, query, params, default=()):
+    """Rows from the newest read-only SQLite file matching `pattern`, or `default` if
+    there's none or its schema isn't what we expect (it's another app's, and may change)."""
     import sqlite3
     import urllib.request
     dbs = glob.glob(os.path.expanduser(pattern))
     if not dbs:
-        return []
+        return default
     db = max(dbs, key=os.path.getmtime)
     try:
         con = sqlite3.connect("file:%s?mode=ro" % urllib.request.pathname2url(db), uri=True, timeout=1)
@@ -312,7 +313,7 @@ def _sqlite_rows(pattern, query, params):
         con.close()
         return rows
     except Exception:
-        return []
+        return default
 
 
 def _local_storage(path, key):
@@ -444,6 +445,39 @@ def _ancestor(names):
     return None
 
 
+def _app_of(pid):
+    """Bundle id of the nearest app above process `pid` (the terminal, IDE or app it
+    runs in), or None. Claude Code's own CLI bundle is looked past."""
+    try:
+        out = subprocess.run(["/bin/ps", "-A", "-o", "pid=,ppid=,comm="],
+                             capture_output=True, text=True, timeout=2).stdout
+    except (OSError, subprocess.SubprocessError):
+        return None
+    procs = {}
+    for line in out.splitlines():
+        p = line.strip().split(None, 2)
+        if len(p) == 3 and p[0].isdigit() and p[1].isdigit():
+            procs[int(p[0])] = (int(p[1]), p[2])
+    if pid not in procs:
+        return None
+    pid, seen = procs[pid][0], set()
+    while pid in procs and pid not in seen and pid > 1:
+        seen.add(pid)
+        ppid, comm = procs[pid]
+        if ".app/" in comm:
+            app = comm.split(".app/", 1)[0] + ".app"
+            try:
+                import plistlib
+                with open(os.path.join(app, "Contents", "Info.plist"), "rb") as f:
+                    bundle = plistlib.load(f).get("CFBundleIdentifier")
+            except (OSError, ValueError, ImportError):
+                return None
+            if bundle != CLAUDE_CLI_BUNDLE:
+                return bundle
+        pid = ppid
+    return None
+
+
 def _proc_start(pid):
     """When process `pid` started, or "" if it isn't running."""
     try:
@@ -476,6 +510,18 @@ def _t3_env():
 # One adapter per agent. Each says how to install its hooks, how to read its hook
 # events, how to get back to a session, and (optionally) what its own records say.
 # To add an agent, subclass Agent and add it to AGENTS.
+
+def _app_unread(rec, x, unread, now):
+    """Takes the app's own unread mark (its sidebar dot) for a session. Marked unread
+    since the last pass, by the app or by you ("Mark as unread"): unread. Not marked:
+    read, after a moment's grace (the app sets the mark just after the turn ends)."""
+    x["unread"] = unread
+    if unread and not rec.get("app_unread"):
+        x["marked"] = True
+    if not unread and now - rec.get("updated_at", 0) > 5:
+        x["read"] = True
+    rec["app_unread"] = unread
+
 
 class Agent:
     name = ""      # short id, used in record keys and hook commands
@@ -611,9 +657,16 @@ def _install_claude_style(path, tool, events):
     _edit_json(path, fn)
 
 
-def _uninstall_claude_style(path):
+def _uninstall_claude_style(path, quiet=False):
     if not os.path.exists(path):
         return
+    if quiet:
+        try:
+            with open(path) as f:
+                if json.dumps(HOOK_MARKER)[1:-1] not in f.read():  # as it's escaped in JSON
+                    return
+        except OSError:
+            return
 
     def fn(data):
         _strip_ours(data.get("hooks", {}))
@@ -630,13 +683,7 @@ class Claude(Agent):
     DESKTOP_SESSIONS = "~/Library/Application Support/Claude/claude-code-sessions"
     DESKTOP_STORAGE = "~/Library/Application Support/Claude/Local Storage/leveldb"
     _live = {}
-    EVENTS = [
-        ("SessionStart", None), ("UserPromptSubmit", None),
-        ("PreToolUse", "AskUserQuestion|ExitPlanMode"), ("PermissionRequest", None),
-        ("Notification", "|".join(sorted(WAIT_NOTIFICATIONS))),
-        ("PostToolUse", None), ("PostToolUseFailure", None),
-        ("Stop", None), ("SessionEnd", None),
-    ]
+    _apps = {}  # pid -> the app it runs in (cached: a process doesn't move)
 
     def translate(self, event, data):
         if _t3_env():
@@ -675,13 +722,14 @@ class Claude(Agent):
                 return ("running", "", ts)
         return None
 
-    def desktop_sessions(self, since):
-        """Claude Desktop's own session files, by CLI session id."""
+    def desktop_sessions(self, since, marked=()):
+        """Claude Desktop's own session files, by CLI session id: the ones active since
+        `since`, and any Desktop marks unread however old."""
         out = {}
         pattern = os.path.join(os.path.expanduser(self.DESKTOP_SESSIONS), "*", "*", "local_*.json")
         for f in glob.glob(pattern):
             try:
-                if os.path.getmtime(f) < since:
+                if os.path.getmtime(f) < since and os.path.basename(f)[:-5] not in marked:
                     continue
                 with open(f) as fh:
                     d = json.load(fh)
@@ -702,8 +750,10 @@ class Claude(Agent):
             return None
 
     def live_sessions(self):
-        """Claude Code's own registry of running sessions: session id -> pid. Each
-        process keeps a file there while it runs."""
+        """Claude Code's own registry of running sessions, by session id. Each process
+        keeps a file there while it runs, and rewrites it as its state changes:
+        `status` is busy / waiting / idle (or shell), and `waitingFor`, while waiting,
+        is "permission prompt", "input needed" (a question) or another dialog."""
         out = {}
         for f in glob.glob(os.path.join(os.path.expanduser(self.REGISTRY), "*.json")):
             try:
@@ -714,28 +764,89 @@ class Claude(Agent):
                 pass  # running, as another user
             except (OSError, ValueError, KeyError, TypeError):
                 continue
-            out[d.get("sessionId")] = int(d["pid"])
+            d["pid"] = int(d["pid"])
+            out[d.get("sessionId")] = d
         return out
 
     def alive(self, rec):
         # Desktop sessions outlive their process: the app resumes them.
         if (rec.get("jump") or {}).get("kind") == "url":
             return None
-        pid = self._live.get(rec.get("session_id"))
-        if pid:
-            rec["pid"] = pid
+        live = self._live.get(rec.get("session_id"))
+        if live:
+            rec["pid"] = live["pid"]
             return True
         # Gone from the registry. Only trusted once we've seen it there.
         return False if rec.get("pid") else None
 
+    @staticmethod
+    def pending_tool(path):
+        """The tool the last assistant message is waiting on, from the transcript."""
+        for raw in _tail(path, 64 * 1024):
+            if b'"assistant"' not in raw:
+                continue
+            try:
+                d = json.loads(raw)
+            except ValueError:
+                continue
+            if d.get("type") != "assistant":
+                continue
+            content = (d.get("message") or {}).get("content") or []
+            names = [c.get("name") for c in content if isinstance(c, dict) and c.get("type") == "tool_use"]
+            return names[-1] if names else None
+        return None
+
+    def registry_state(self, d, transcript=""):
+        """(state, reason) from a registry record; None once the turn is over (idle:
+        the transcript says whether it finished or was stopped)."""
+        status = d.get("status")
+        if status == "busy":
+            return ("running", "")
+        if status == "waiting":
+            tool = self.pending_tool(transcript) if transcript else None
+            if tool == "ExitPlanMode":
+                return ("waiting", "plan")
+            if tool in ASK_TOOLS or d.get("waitingFor") == "input needed":
+                return ("waiting", "question")
+            return ("waiting", "permission")
+        return None
+
     def scan(self, recs, now, facts):
         self._live = self.live_sessions()
+        for sid, d in self._live.items():
+            if not sid or d.get("spare") or d.get("kind") not in (None, "interactive") or not d.get("status"):
+                continue
+            key = "claude-" + _safe(sid)
+            desktop = d.get("entrypoint") == "claude-desktop"
+            if not desktop and d["pid"] not in self._apps:
+                self._apps[d["pid"]] = _app_of(d["pid"])
+            app = None if desktop else self._apps.get(d["pid"])
+            if app == T3_BUNDLE:
+                continue  # a T3 Code thread; its own adapter shows it
+            if key not in recs:
+                if d.get("status") == "idle" and (d.get("statusUpdatedAt") or 0) / 1000 < now - RECENT:
+                    continue
+                rec = recs[key] = _new_record("claude", sid, d.get("cwd"))
+                found = glob.glob(os.path.join(os.path.expanduser(self.PROJECTS), "*", sid + ".jsonl"))
+                if found:
+                    rec["transcript"] = found[0]
+            rec = recs[key]
+            host = d.get("hostSessionId") or ""
+            if desktop and host.startswith("local_"):
+                rec["jump"] = {"kind": "url", "target": "claude://claude.ai/epitaxy/" + host,
+                               "fallback": self.bundle}
+            elif not desktop:
+                rec["jump"] = {"kind": "app", "target": app or self.bundle}
+            if d.get("name") and not rec.get("name"):
+                rec["name"] = d["name"]
+            facts.setdefault(key, {})["live"] = (self.registry_state(d, rec.get("transcript")),
+                                                 (d.get("statusUpdatedAt") or 0) / 1000)
         unread = self.desktop_unread()
-        for sid, d in self.desktop_sessions(now - RECENT).items():
+        for sid, d in self.desktop_sessions(now - RECENT, unread or ()).items():
             key = "claude-" + _safe(sid)
             active = (d.get("lastActivityAt") or 0) / 1000
             if key not in recs:
-                if d.get("isArchived") or active < now - RECENT:
+                if d.get("isArchived") or (active < now - RECENT and d["sessionId"] not in (unread or ())):
                     continue
                 rec = recs[key] = _new_record("claude", sid, d.get("cwd"))
                 found = glob.glob(os.path.join(os.path.expanduser(self.PROJECTS), "*", sid + ".jsonl"))
@@ -748,12 +859,9 @@ class Claude(Agent):
                 rec["name"] = d["title"]
             if d.get("isArchived"):
                 rec["hidden"] = True
-            facts[key] = {"focused": (d.get("lastFocusedAt") or 0) / 1000}
+            facts.setdefault(key, {})["focused"] = (d.get("lastFocusedAt") or 0) / 1000
             if unread is not None:
-                in_unread = d["sessionId"] in unread
-                facts[key]["unread"] = in_unread
-                if not in_unread and now - rec.get("updated_at", 0) > 5:
-                    facts[key]["read"] = True
+                _app_unread(rec, facts[key], d["sessionId"] in unread, now)
 
     def on_screen(self, rec):
         """The Desktop session you were looking at when it finished."""
@@ -765,7 +873,10 @@ class Claude(Agent):
         return bool(focus) and focus.get(host, -1) >= max(focus.values())
 
     def install(self):
-        _install_claude_style(os.path.expanduser(self.SETTINGS), self.name, self.EVENTS)
+        # No hooks: Claude Code's own session registry says everything. Clear out the
+        # ones older versions added.
+        _uninstall_claude_style(os.path.expanduser(self.SETTINGS), quiet=True)
+        print("  no hooks needed; reads Claude Code's own session state.")
 
     def uninstall(self):
         _uninstall_claude_style(os.path.expanduser(self.SETTINGS))
@@ -838,16 +949,39 @@ class Codex(Agent):
             return "subagent"
         return p.get("thread_source") or ""
 
+    @staticmethod
+    def app_unread():
+        """The Codex app's own unread marks (its sidebar dots, "Mark as unread"
+        included), as thread ids. None if they can't be read."""
+        rows = _sqlite_rows(
+            os.path.join(CODEX_HOME, ".codex-global-state.sqlite"),
+            "SELECT value FROM settings WHERE key = 'electron-thread-read-state-v1'", (), default=None)
+        if not rows:
+            return None
+        try:
+            out = set()
+            for hosts in json.loads(rows[0][0])["unreadByIdentity"].values():
+                for host, ids in hosts.items():
+                    if host.split(":")[0] == "local":  # threads on this Mac
+                        out.update(ids)
+            return out
+        except (TypeError, ValueError, KeyError, AttributeError):
+            return None
+
     def scan(self, recs, now, facts):
+        marked = self.app_unread()
         known = [r["session_id"] for r in recs.values() if r.get("tool") == "codex" and r.get("session_id")]
+        ids = known + sorted(marked or ())
         rows = _sqlite_rows(
             os.path.join(CODEX_HOME, "state_*.sqlite"),
             "SELECT t.id, t.rollout_path, t.cwd, COALESCE(NULLIF(t.name, ''), t.title),"
             " t.archived, t.originator, t.thread_source, r.first_unread_turn"
             " FROM threads t LEFT JOIN thread_read_receipts r ON r.thread_id = t.id"
-            " WHERE t.updated_at_ms >= ? OR t.id IN (%s)" % ",".join("?" * len(known)),
-            [int((now - RECENT) * 1000)] + known)
-        for tid, rollout, cwd, title, archived, originator, source, unread in rows:
+            " WHERE t.updated_at_ms >= ? OR t.id IN (%s)" % ",".join("?" * len(ids)),
+            [int((now - RECENT) * 1000)] + ids, default=None)
+        threads = set()
+        for tid, rollout, cwd, title, archived, originator, source, receipt in rows or ():
+            threads.add(tid)
             key = "codex-" + _safe(tid)
             if key not in recs:
                 if archived or source != "user" or originator != "Codex Desktop":
@@ -862,12 +996,22 @@ class Codex(Agent):
                 rec["hidden"] = True
             if originator == "Codex Desktop":
                 rec["jump"] = {"kind": "url", "target": "codex://threads/" + tid, "fallback": self.bundle}
-                facts[key] = {"read": not unread, "unread": bool(unread)}
+                # The sidebar's own marks when we can read them, else the read receipt.
+                unread = tid in marked if marked is not None else bool(receipt)
+                _app_unread(rec, facts.setdefault(key, {}), unread, now)
 
         for key in [k for k, r in recs.items() if r.get("tool") == "codex"]:
             rec = recs[key]
             if not rec.get("transcript"):
                 # Left by an internal Codex app session (see translate): drop it.
+                remove(key)
+                del recs[key]
+                continue
+            if (rows is not None and rec.get("session_id") not in threads
+                    and (rec.get("jump") or {}).get("target", "").startswith("codex://")
+                    and (not os.path.exists(rec["transcript"]) or now - rec.get("since", now) > 60)):
+                # The app no longer has this thread (deleted, or one it never listed:
+                # it opens as "Chat unavailable on this computer"). Nothing to show.
                 remove(key)
                 del recs[key]
                 continue
@@ -1264,10 +1408,38 @@ def collect():
                 rec["updated_at"] = rec["since"] = ts
             else:
                 rec["updated_at"] = max(rec.get("updated_at", 0), ts)
+        # The agent's own live state (Claude Code's session registry) wins over both
+        # hooks and transcript while it's newer than what we have.
+        if "live" in x:
+            live, l_ts = x["live"]
+            fresh = l_ts >= rec.get("updated_at", 0) - 2
+            if live and fresh and live[0] != rec.get("state"):
+                rec["state"], rec["reason"], rec["seen"] = live[0], live[1], True
+                rec.pop("detail", None)
+                rec.pop("seen_at", None)
+                rec["updated_at"] = rec["since"] = int(l_ts)
+            elif (live and fresh and live[0] == "waiting" and live[1] != rec.get("reason")
+                  and rec.get("reason") != "plan"):  # a plan review shows as a permission prompt
+                rec["reason"] = live[1]
+                rec.pop("detail", None)
+            elif not live and fresh and rec.get("state") in ("running", "waiting", None):
+                # The turn is over: finished, or stopped (the transcript says which).
+                was = rec.get("state")
+                state, reason = (turn[0], turn[1]) if turn and turn[0] in ("done", "idle") else ("idle", "")
+                rec["state"], rec["reason"] = state, reason
+                rec["seen"] = state != "done" or not (was or x.get("unread"))
+                rec.pop("detail", None)
+                rec.pop("seen_at", None)
+                rec["updated_at"] = rec["since"] = int(max(l_ts, turn[2] if turn else 0))
         if rec.get("state") is None:
             rec["state"] = "idle"
             rec["updated_at"] = rec["since"] = int(mtime or now)
         rec.setdefault("since", rec.get("updated_at", 0))  # records from before "since"
+        # The app has just marked it unread (a finish, or "Mark as unread" by hand).
+        # Edge-triggered, so "Mark read" here sticks until the app marks it again.
+        if x.get("marked") and rec["state"] in ("done", "idle") and (rec["state"] == "idle" or rec.get("seen")):
+            rec["state"], rec["reason"], rec["seen"] = "done", "", False
+            rec.pop("seen_at", None)
         # A terminal session whose process is gone has ended, even without the
         # end-of-session hook (say, the terminal window was closed).
         if agent and not rec.get("hidden") and color_of(rec) != "read" and agent.alive(rec) is False:

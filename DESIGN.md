@@ -23,10 +23,11 @@
 ## 架构
 
 ```
-Claude Code hooks ─┐                                       ~/.agent-status/
-Codex hooks ───────┼─► bin/agent-status hook <agent> ─►     <agent>-<session_id>.json
-Antigravity hooks ─┘   (适配器把事件翻译成通用事件，            │
+Codex hooks ───────┬─► bin/agent-status hook <agent> ─►     ~/.agent-status/
+Antigravity hooks ─┘                                        <agent>-<session_id>.json   (适配器把事件翻译成通用事件，            │
                         再交给同一个状态机)                     │
+                                                               ▼
+Claude Code 会话登记 ~/.claude/sessions/<pid>.json ──────────────►│（没有 hook）
                                                                ▼
                                      菜单栏 App 监听目录 → agent-status status → 徽标 + 面板
                                                                │ 点击
@@ -78,10 +79,11 @@ Antigravity hooks ─┘   (适配器把事件翻译成通用事件，          
 | 对话记录末尾（Claude：`~/.claude/projects/*/<id>.jsonl`；Codex：`rollout-*.jsonl`，路径来自 hook 的 `transcript_path` 或 Codex 数据库） | 最后一轮的结果：结束（`stop_reason: end_turn`、`stop_hook_summary` / `task_complete`）、中断（`[Request interrupted by user` / `turn_aborted`）、还在跑 | 对话记录比最近一次 hook 新（多于 2 秒）时，以对话记录为准。审批和提问只认 hook |
 | Claude Desktop 的会话文件 `~/Library/Application Support/Claude/claude-code-sessions/*/*/local_*.json` | `cliSessionId`、`title`、`isArchived`、`lastFocusedAt` | 发现会话、显示真实标题、隐藏归档；完成后又点开过（`lastFocusedAt` ≥ 完成时间）算已读 |
 | Claude Desktop 的 Local Storage（`Local Storage/leveldb` 里的 `epitaxy-unread-v1`） | 侧边栏的未读标记 `unreadIds` | 我们没看着它完成的会话（重新打开的旧对话、扫描发现的会话），以 Desktop 自己的未读标记为准 |
-| Claude Code 的会话登记 `~/.claude/sessions/<pid>.json` | 每个运行中进程的 `sessionId` 和 `pid`，进程在文件就在 | 终端会话的进程没了就算结束（隐藏），即使没收到 `SessionEnd` |
-| Codex 数据库 `~/.codex/state_*.sqlite`（只读） | `threads` 的标题、`archived`、`originator`；`thread_read_receipts.first_unread_turn` | 发现会话、显示标题、隐藏归档；`originator = Codex Desktop` 时生成 `codex://threads/<id>`；未读标记直接用 App 自己的 |
+| Claude Code 的会话登记 `~/.claude/sessions/<pid>.json` | 每个运行中进程的 `sessionId`、`pid`，以及它自己的状态 `status`（`busy` / `waiting` / `idle` / `shell`）、`waitingFor`（`permission prompt`、`input needed` 等）、`statusUpdatedAt`。进程在文件就在，状态一变就原地重写 | **运行中、等你处理、这一轮结束都以它为准**（比最近一次 hook 新时），Claude Code 已不装 hook（`install` 会清掉旧版装的）：`busy` → 运行中；`waiting` → 等你处理（对话记录里待执行的工具是 `ExitPlanMode` 算计划审批，`AskUserQuestion` 或 `input needed` 算提问，其余是审批）；`idle` → 这一轮结束，结束还是中断看对话记录。也用来发现会话。`entrypoint = claude-desktop` 时用 `hostSessionId` 生成 Desktop 链接；否则沿进程树往上找第一个 .app（跳过 Claude Code CLI 自带的 `claude.app`），点击时切到那个终端或 IDE；上层是 T3 Code 的跳过，由 T3 Code 适配器显示。终端会话的进程没了就算结束（隐藏） |
+| Codex 数据库 `~/.codex/state_*.sqlite`（只读） | `threads` 的标题、`archived`、`originator` | 发现会话、显示标题、隐藏归档；`originator = Codex Desktop` 时生成 `codex://threads/<id>`；App 里已经没有的会话（被删除，或打开显示"此聊天在这台电脑上不可用"）直接删掉记录 |
+| Codex App 的界面状态 `~/.codex/.codex-global-state.sqlite`（只读，`settings` 表的 `electron-thread-read-state-v1`） | 侧边栏的未读标记 `unreadByIdentity.*.local:*`（包括手动"标为未读"） | 未读以 App 自己的标记为准；读不到时退回 `thread_read_receipts.first_unread_turn`。这里的标记不受 24 小时限制，很久以前的会话被标成未读也会显示 |
 
-一轮结束算不算未读：只有我们看着这一轮在跑（之前是运行中或等你处理），或者 App 自己把它标成未读，才算未读。只从对话记录里发现的结束（比如在 Desktop 里重新打开一个旧对话，它会发 `SessionStart(resume)`），默认已读。
+一轮结束算不算未读：只有我们看着这一轮在跑（之前是运行中或等你处理），或者 App 自己把它标成未读，才算未读。App 的未读标记按"变化"生效：标记从无到有（App 在一轮结束时标上，或你手动"标为未读"）就算未读；标记一直在时，面板里点"全部已读"会保持已读，直到 App 再次标上。Claude Desktop 的 `epitaxy-unread-v1` 也一样，被标成未读的旧会话同样不受 24 小时限制。只从对话记录里发现的结束（比如在 Desktop 里重新打开一个旧对话，它会发 `SessionStart(resume)`），默认已读。
 
 Codex 的终端会话：hook 触发时记下执行它的 `codex` 进程（pid 和启动时间），进程不在了就算结束。
 
@@ -124,7 +126,7 @@ Desktop 和 Codex App 退出时会给会话发 `SessionEnd`。会话本身保留
 `app/main.swift`，单文件 SwiftUI + AppKit，`install` 时用 `swiftc` 编译成 `build/Agent Status.app`（`LSUIElement`，没有 Dock 图标），用 LaunchAgent `io.github.agent-status` 登录时启动。第一版用的是 SwiftBar 插件，但 SwiftBar 的下拉菜单是系统 NSMenu，只能一行行文字，做不出卡片、分段控件这类面板，所以换成了自己的 App。
 
 - **只负责画。** 状态逻辑全在 `bin/agent-status`，App 运行 `agent-status status` 拿 JSON（各类数量 + 要显示的会话），点击时运行 `agent-status open <key>` / `seen-all`。
-- **什么时候刷新：** 用 `DispatchSource` 监听状态目录，hook 写完文件就立即刷新；打开面板时刷新；徽标上有会话时每 30 秒刷新一次（让第 2 节的校正能跟上 Esc、拒绝审批、在 App 里点开这类不发 hook 的变化），没有会话时不做任何定时刷新。一次刷新大约 0.1 秒 CPU。正在跑时又来的刷新请求合并成一次。
+- **什么时候刷新：** 用 `DispatchSource` 监听状态目录，hook 写完文件就立即刷新；用 FSEvents（文件级事件）监听 `~/.claude/sessions`，Claude Code 一改登记文件就刷新（它是原地写，目录监听收不到）；打开面板时刷新；徽标上有会话时每 30 秒刷新一次（让第 2 节的校正能跟上 Esc、拒绝审批、在 App 里点开这类不发 hook 的变化），没有会话时不做任何定时刷新。一次刷新大约 0.1 秒 CPU。正在跑时又来的刷新请求合并成一次。
 - **徽标：** 一个圆角胶囊，分成黄 / 绿 / 蓝三段实心色块，数字写在色块里（黄底用深色字，绿、蓝底用白字），三段一直显示；数量为 0 的那段颜色变淡，突出有会话的段。用 AppKit 按屏幕倍率直接画，颜色固定，在深浅两种菜单栏里都醒目。
 - **面板：** 三个状态块（等你处理、运行中、已完成未读），点一下只看这一类，再点取消；全部 / Claude / Codex 分段筛选，带各自的会话数；按"等你处理 → 已完成未读 → 运行中"分组的会话行，每行显示应用图标、标题、状态、多久以前、最后一条提示词，点击跳回；底部是"全部已读"（有未读时才出现）、"打开状态目录"和"退出"。会话超过 6 个时列表可滚动。截图见 `docs/images/panel.png`。
 - 面板语言跟随系统（中文或英文）。
@@ -206,9 +208,9 @@ agent-status/
 
 ## 8. 已知限制
 
-- Claude 里按 Esc 中断、拒绝审批都不发 hook，要等下次刷新读到对话记录才从徽标上消失，最多 30 秒（打开面板时会立即刷新）。
+- 在 tmux 里跑的 Claude Code，进程树上找不到终端 App，点击时只能切到 Claude App。
 - 终端会话的进程没了会自动结束，目前支持 Claude Code 和 Codex；Antigravity CLI 还不行。
 - 如果你一直看着某个 Desktop 会话、但 Desktop 不在最前面时它完成了，会记成未读，直到你切走再切回来、在面板里点它或发下一条消息。
-- Desktop 会话文件和未读标记、Claude Code 的会话登记、对话记录格式、Codex 数据库表结构都是应用内部的东西，升级后可能变化。读不到时只是少了校正，hook 那部分照常工作。
+- Desktop 会话文件和未读标记、Claude Code 的会话登记、对话记录格式、Codex 数据库表结构都是应用内部的东西，升级后可能变化。Codex 和 Antigravity 读不到时只是少了校正，hook 那部分照常工作；Claude Code 只有会话登记这一个来源。
 - App 是本机编译、ad-hoc 签名的，不经过公证，所以只能用 `install.sh` 在本机构建，不能直接分发 .app。
 - 深链接属于两个应用的内部接口，没有公开文档，升级后可能失效。所以 `agent-status open` 在链接打不开时，至少要把对应应用切到前台。

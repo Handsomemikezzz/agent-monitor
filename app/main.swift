@@ -150,6 +150,7 @@ final class Store: ObservableObject {
     private var watcher: DispatchSourceFileSystemObject?
     private var t3Watcher: DispatchSourceFileSystemObject?
     private var t3Debouncer: DispatchWorkItem?
+    private var claudeStream: FSEventStreamRef?
     private var timer: Timer?
     private var loading = false
     private var again = false
@@ -162,6 +163,7 @@ final class Store: ObservableObject {
         stateDir = env["AGENT_STATUS_DIR"] ?? (NSHomeDirectory() + "/.agent-status")
         watch()
         watchT3()
+        watchClaude()
         // Hooks cover most changes the moment they happen (see watch()). This timer only
         // catches the few that send no hook, such as Esc in Claude Code or reading a
         // session in the app, so it runs only while there's a session on the badge.
@@ -210,6 +212,26 @@ final class Store: ObservableObject {
         src.setCancelHandler { close(fd) }
         src.resume()
         t3Watcher = src
+    }
+
+    /// Claude Code rewrites its session registry (~/.claude/sessions/<pid>.json) in place
+    /// whenever a session's state changes. A folder watch misses in-place writes, so this
+    /// uses FSEvents with file-level events.
+    private func watchClaude() {
+        let dir = NSHomeDirectory() + "/.claude/sessions"
+        var ctx = FSEventStreamContext(version: 0, info: Unmanaged.passUnretained(self).toOpaque(),
+                                       retain: nil, release: nil, copyDescription: nil)
+        let callback: FSEventStreamCallback = { _, info, _, _, _, _ in
+            guard let info = info else { return }
+            Unmanaged<Store>.fromOpaque(info).takeUnretainedValue().scheduleReload()
+        }
+        let flags = FSEventStreamCreateFlags(kFSEventStreamCreateFlagFileEvents | kFSEventStreamCreateFlagNoDefer)
+        guard let stream = FSEventStreamCreate(nil, callback, &ctx, [dir] as CFArray,
+                                               FSEventStreamEventId(kFSEventStreamEventIdSinceNow), 0.2, flags)
+        else { return }
+        FSEventStreamSetDispatchQueue(stream, .main)
+        FSEventStreamStart(stream)
+        claudeStream = stream
     }
 
     private func scheduleReload() {
